@@ -1,0 +1,56 @@
+# ── 機密與運行資料（千萬不要 commit）──
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+
+# 含 AD 帳密 / Claude API Key 的設定檔
+# 註：repo 只 commit *.example.xlsx 範本，實際使用版本被 ignore
+ChangeGear_AutoAssign_Rules.xlsx
+
+# Log 檔（含工單 ID、人名、Description 等真實資料）
+*.log
+
+# Debug 截圖（含工單頁面）
+debug_*.png
+*.png
+
+# ── Python ──
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual env
+venv/
+env/
+.venv/
+ENV/
+
+# ── IDE ──
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# ── Playwright ──
+.playwright/
+playwright-report/
+test-results/
