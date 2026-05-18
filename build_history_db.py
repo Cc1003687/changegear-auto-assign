@@ -7,10 +7,18 @@ ChangeGear 歷史資料庫建立工具
 
 功能:
     - 自動分頁爬取 View 的歷史工單（每頁 50 筆）
-    - Phase 1 (快速): 從列表抓 summary / owner / assigned_to
+    - Phase 1 (快速): 從列表抓 summary / owner / assigned_to / ticket_date
     - Phase 2 (深度): 用獨立 page 開啟每張工單取得 incident_type / description（不影響列表頁）
     - 斷點續傳: 已存在的 ticket_id 自動跳過
     - 結束後印出統計報告
+
+儲存條件（OR 任一成立即收錄）:
+    1. 工單日期 >= MIN_TICKET_DATE（預設 2024-01-01，「2024 年以後的所有工單」）
+    2. Owner 為 Help Desk
+    3. Assigned To 為指定人員（TARGET_ASSIGNEES，CMDB 二次人名比對學習用）
+
+跳過條件:
+    - 工單日期早於 MIN_TICKET_DATE → 一律跳過（不論 Owner / Assigned To）
 """
 
 import asyncio
@@ -46,6 +54,16 @@ VIEWS = [
 DEEP_SCRAPE = True
 # 最多處理幾張工單（0=無限制）
 MAX_TICKETS = 0
+
+# 工單日期下限（ISO 字串格式 YYYY-MM-DD）：早於此日期的工單一律跳過
+# 設定為 2024-01-01 代表只爬取 2024 年以後（含）建立／修改的工單
+MIN_TICKET_DATE = "2024-01-01"
+
+# 列表 row 內日期匹配 pattern：支援 YYYY-MM-DD、YYYY/MM/DD、M/D/YYYY 三種格式
+_DATE_PAT = re.compile(
+    r"\b(\d{4})[-/](\d{1,2})[-/](\d{1,2})\b"     # YYYY-MM-DD / YYYY/MM/DD
+    r"|\b(\d{1,2})/(\d{1,2})/(\d{4})\b"          # M/D/YYYY（ChangeGear 常見）
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -171,6 +189,23 @@ async def parse_list_page(page) -> list[dict]:
             asgn_el  = await row.query_selector("td[id$='_11'] .GridDataItem")
             assigned = (await asgn_el.inner_text()).strip() if asgn_el else ""
 
+            # ── 掃描整列所有 cell，萃取最新的日期字串（不依賴特定欄位索引）──
+            #    支援 ChangeGear 常見的 M/D/YYYY 與 YYYY-MM-DD 格式
+            ticket_date = ""
+            cells = await row.query_selector_all(".GridDataItem")
+            for cell in cells:
+                txt = (await cell.inner_text() or "").strip()
+                dm  = _DATE_PAT.search(txt)
+                if not dm:
+                    continue
+                if dm.group(1):                                # YYYY-MM-DD
+                    y, mo, d = dm.group(1), dm.group(2), dm.group(3)
+                else:                                          # M/D/YYYY
+                    mo, d, y = dm.group(4), dm.group(5), dm.group(6)
+                iso = f"{int(y):04d}-{int(mo):02d}-{int(d):02d}"
+                if iso > ticket_date:
+                    ticket_date = iso   # 取列內最新的日期作為「Modified Date」近似值
+
             if item_id and (owner or assigned):
                 tickets.append({
                     "oid": oid,
@@ -179,6 +214,7 @@ async def parse_list_page(page) -> list[dict]:
                     "summary": summary,
                     "owner": owner,
                     "assigned_to": assigned,
+                    "ticket_date": ticket_date,
                 })
         except Exception:
             continue
@@ -302,17 +338,26 @@ async def main():
                 for t in tickets:
                     total_seen += 1
 
-                    # ── 儲存條件：Owner 為 Help Desk，或 Assigned To 為指定人員 ──
-                    # 指定人員（用於 CMDB 鑑別審查層的二次人名比對學習）
+                    # ── 日期過濾：早於 MIN_TICKET_DATE 一律跳過 ───────────
+                    ticket_date = t.get("ticket_date") or ""
+                    if ticket_date and ticket_date < MIN_TICKET_DATE:
+                        total_skipped += 1
+                        continue
+
+                    # ── 儲存條件（OR 邏輯，任一條件成立即收錄）─────────────
+                    #   1. ticket_date >= MIN_TICKET_DATE（2024 年以後的所有 ticket）
+                    #   2. Owner 為 Help Desk
+                    #   3. Assigned To 為指定人員（CMDB 二次人名比對學習用）
                     # 範例值請依實際組織人員 AD 帳號替換（小寫，substring 比對即可命中）
                     TARGET_ASSIGNEES = ("user_a", "user_b", "user_c")
                     owner_val    = (t.get("owner") or "").strip().lower()
                     assigned_val = (t.get("assigned_to") or "").strip().lower()
+                    is_recent    = bool(ticket_date) and ticket_date >= MIN_TICKET_DATE
                     is_helpdesk  = ("help desk" in owner_val) or ("helpdesk" in owner_val)
                     is_target_assignee = any(
                         target in assigned_val for target in TARGET_ASSIGNEES
                     )
-                    if not (is_helpdesk or is_target_assignee):
+                    if not (is_recent or is_helpdesk or is_target_assignee):
                         total_skipped += 1
                         continue
 
@@ -349,10 +394,13 @@ async def main():
     conn.close()
 
     log.info("══════════════════════════════")
-    log.info(f"爬取完成！（儲存條件：Owner=Help Desk 或 Assigned To ∈ TARGET_ASSIGNEES）")
+    log.info(
+        f"爬取完成！（儲存條件：ticket_date >= {MIN_TICKET_DATE} "
+        f"或 Owner=Help Desk 或 Assigned To ∈ TARGET_ASSIGNEES）"
+    )
     log.info(f"  掃描工單數 : {total_seen}")
     log.info(f"  新增記錄數 : {total_saved}")
-    log.info(f"  跳過（不符條件或已存在）: {total_skipped}")
+    log.info(f"  跳過（日期過早 / 不符條件 / 已存在）: {total_skipped}")
     log.info(f"  DB 總記錄數: {end_count}（原 {start_count}）")
     log.info("══════════════════════════════")
 
@@ -363,6 +411,7 @@ if __name__ == "__main__":
     print(f"  DB 路徑    : {DB_PATH}")
     print(f"  深度爬取   : {DEEP_SCRAPE}")
     print(f"  最大筆數   : {'無限制' if MAX_TICKETS == 0 else MAX_TICKETS}")
+    print(f"  日期下限   : {MIN_TICKET_DATE}（早於此日期一律跳過）")
     print(f"  headless   : {HEADLESS}")
     print("=" * 50)
     print("按 Enter 開始，Ctrl+C 隨時中止...")
