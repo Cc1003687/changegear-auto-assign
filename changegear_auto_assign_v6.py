@@ -655,15 +655,11 @@ async def claude_assign(summary: str, description: str, requester: str,
     inc_types = db_get_incident_types()
     inc_types_text = "\n".join(f"- {t}" for t in inc_types) if inc_types else "（DB 尚無記錄）"
 
-    prompt = f"""你是 IT 服務台的派單助理。請根據新工單資訊與歷史參考工單，判斷最合適的派單結果。
-
-## 新工單
-- 標題（Summary）: {summary}
-- 內文（Description）: {description[:600] if description else "（無）"}
-- 寄件者（Requester）: {requester}
-
-## 歷史參考工單（依相似度排序）
-{candidates_text}
+    # ══ Prompt 結構（為了啟用 Prompt Caching，穩定內容放 system，動態內容放 user）══
+    # 系統指令（穩定，可快取）：角色、規則、有效清單、JSON 格式
+    #   - 多輪呼叫之間 inc_types / req_items 與規則不變 → 命中快取，成本 ≈ 0.1×
+    #   - cache_control 標記放在「最後一個穩定 block」，標記前的所有 system 一起進快取
+    system_text = f"""你是 IT 服務台的派單助理。請根據新工單資訊與歷史參考工單，判斷最合適的派單結果。
 
 ## 系統中有效的 Incident Type 清單（格式：第一層 > 第二層 > 第三層）
 {inc_types_text}
@@ -679,7 +675,7 @@ async def claude_assign(summary: str, description: str, requester: str,
 5. req_item 請從上方清單中選擇最符合的一項；若都不符合則填空字串。
 6. 只回傳 JSON，不要任何其他文字或 markdown。
 
-回傳格式：
+## 回傳格式
 {{
   "owner": "負責人",
   "assigned_to": "指派人員（不可空白）",
@@ -691,13 +687,40 @@ async def claude_assign(summary: str, description: str, requester: str,
   "reasoning": "判斷理由（一句話）"
 }}"""
 
+    # 使用者訊息（動態，每次不同 → 不快取）：新工單 + 候選清單
+    user_text = f"""## 新工單
+- 標題（Summary）: {summary}
+- 內文（Description）: {description[:600] if description else "（無）"}
+- 寄件者（Requester）: {requester}
+
+## 歷史參考工單（依相似度排序）
+{candidates_text}"""
+
     try:
         client = anthropic.AsyncAnthropic(api_key=api_key)
         response = await client.messages.create(
             model=RULES.get("claude_model", "claude-haiku-4-5"),
             max_tokens=512,
-            messages=[{"role": "user", "content": prompt}],
+            system=[
+                {
+                    "type": "text",
+                    "text": system_text,
+                    "cache_control": {"type": "ephemeral"},   # 5 分鐘 TTL
+                }
+            ],
+            messages=[{"role": "user", "content": user_text}],
         )
+
+        # ── 觀測快取命中率 ──────────────────────────────────────────
+        u = response.usage
+        cache_create = getattr(u, "cache_creation_input_tokens", 0) or 0
+        cache_read   = getattr(u, "cache_read_input_tokens", 0) or 0
+        if cache_create or cache_read:
+            log.info(
+                f"[Claude cache] read={cache_read} write={cache_create} "
+                f"uncached={u.input_tokens} output={u.output_tokens}"
+            )
+
         raw = response.content[0].text.strip()
 
         # 移除可能的 markdown code block
