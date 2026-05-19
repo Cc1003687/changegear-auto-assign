@@ -507,6 +507,52 @@ def cmdb_validate(assigned_to: str, owner: str, req_item: str) -> tuple[bool, st
     return False, "；".join(reasons)
 
 
+def cmdb_direct_lookup(req_item: str) -> dict | None:
+    """
+    依 Requester's Item 名稱「直接」從 CMDB 取得擁有者，作為派單候選。
+
+    與 cmdb_validate 不同：
+      - cmdb_validate 是審查層（驗證既有派單建議是否正確）
+      - cmdb_direct_lookup 是來源層（產生派單建議）
+
+    對應關係：
+      CMDB.owner       → 派單 Assigned To（個人擁有者）
+      CMDB.team_owner  → 派單 Owner       （團隊擁有者）
+
+    回傳 dict（owner / assigned_to / requester_item / _score / _source），
+    或 None（CMDB 無對應、或缺少必要的擁有者資料）。
+
+    _score 設為 0.80（介於 CMDB 審查門檻 0.75 與 AI 門檻 0.85 之間），
+    觸發「信心 >= 0.75 跳過 Help Desk 過濾」例外規則。
+    """
+    if not req_item:
+        return None
+    cmdb = cmdb_lookup(req_item)
+    if not cmdb:
+        return None
+
+    cmdb_assigned = (cmdb.get("owner") or "").strip()
+    cmdb_team     = (cmdb.get("team_owner") or "").strip()
+
+    if not cmdb_assigned:
+        # 沒個人擁有者 → 不派單（無法決定 Assigned To）
+        return None
+    if not cmdb_team:
+        # 缺團隊資料 → 預設 Help Desk
+        cmdb_team = RULES.get("default_owner", "Help Desk")
+
+    return {
+        "owner":          cmdb_team,
+        "assigned_to":    cmdb_assigned,
+        "requester_item": cmdb.get("critical_name", ""),
+        "inc_parent":     "",   # CMDB 無 Incident Type 資訊，留給後續層級補
+        "inc_child":      "",
+        "inc_item":       "",
+        "_score":         0.80,
+        "_source":        f"CMDB直接派單(CI={cmdb.get('critical_name','')})",
+    }
+
+
 def extract_hi_name(description: str) -> str:
     """
     從工單描述中提取問候語（Hi / Hello / Dear + 名字）裡的收件人姓名。
@@ -818,6 +864,48 @@ async def determine_assignment(summary: str, description: str = "",
         f"Priority: {_priority}"
     )
 
+    # ── 預先計算 Requester's Item 候選 + CMDB Direct 候選 ─────────────
+    # 用 Excel 關鍵字規則從工單文字導出可能的 Requester's Item，
+    # 再用該名稱查 CMDB 取得擁有者，作為「CMDB 直接派單」候選。
+    # 此候選會在 AI/DB 兩條路徑作為 fallback 使用。
+    _excel_ri_match = match_keyword(combined, RULES["requester_items"])
+    _ri_candidate   = _excel_ri_match["item"] if _excel_ri_match else ""
+    _excel_kw_match = match_keyword(combined, RULES["keyword_rules"])  # 預先取 Excel inc_type
+    _cmdb_direct    = cmdb_direct_lookup(_ri_candidate)
+    if _cmdb_direct:
+        log.info(
+            f"CMDB Direct 候選: Owner={_cmdb_direct['owner']} / "
+            f"Assigned={_cmdb_direct['assigned_to']} "
+            f"(CI={_cmdb_direct['requester_item']}, score={_cmdb_direct['_score']:.2f})"
+        )
+
+    def _fill_inc_type(base: dict) -> dict:
+        """CMDB Direct 缺 Incident Type → 從 Excel 關鍵字補；都沒有則用安全預設值。"""
+        if _excel_kw_match:
+            base["inc_parent"] = _excel_kw_match["inc_parent"]
+            base["inc_child"]  = _excel_kw_match["inc_child"]
+            base["inc_item"]   = _excel_kw_match["inc_item"]
+        else:
+            base["inc_parent"] = "Service Request"
+            base["inc_child"]  = "Infrastructure"
+            base["inc_item"]   = "Standard Request"
+        return base
+
+    def _build_cmdb_direct_dispatch() -> dict:
+        """組裝 CMDB Direct 派單結果（含 inc_type 補齊、impact/priority/due_date）。"""
+        result = {
+            "owner":          _cmdb_direct["owner"],
+            "assigned_to":    _cmdb_direct["assigned_to"],
+            "requester_item": _cmdb_direct["requester_item"],
+            "impact":         _impact,
+            "urgency":        _urgency,
+            "priority":       _priority,
+            "due_date":       _due_date,
+            "_score":         _cmdb_direct["_score"],
+            "_source":        _cmdb_direct["_source"],
+        }
+        return _fill_inc_type(result)
+
     # ══ AI 模式：Claude API Key 已設定 ════════════════════════════════
     if RULES.get("claude_api_key"):
         candidates = db_get_candidates(
@@ -917,8 +1005,14 @@ async def determine_assignment(summary: str, description: str = "",
                     )
                     return None
         else:
-            # Claude 信心不足（< 0.85）或呼叫失敗 → 不派單
-            log.warning(f"Claude 信心不足，工單將僅追蹤記錄不派單 | {summary[:50]}")
+            # Claude 信心不足（< 0.85）或呼叫失敗 → 嘗試 CMDB Direct fallback
+            if _cmdb_direct:
+                log.info(
+                    f"Claude 信心不足，改用 CMDB Direct 派單 | "
+                    f"{_cmdb_direct['_source']}"
+                )
+                return _build_cmdb_direct_dispatch()
+            log.warning(f"Claude 信心不足且無 CMDB Direct，工單僅追蹤不派單 | {summary[:50]}")
             return None
 
     # ══ 傳統模式：無 Claude API Key ═══════════════════════════════════
@@ -927,6 +1021,16 @@ async def determine_assignment(summary: str, description: str = "",
 
     # ① SQLite 歷史比對
     hist = db_find_similar(summary, description, requester)
+
+    # ── CMDB Direct vs DB：取分數較高者作為主要派單來源 ──────────────
+    # CMDB Direct 預設 _score=0.80，當 DB 命中分數低於此值時優先採用 CMDB Direct
+    if _cmdb_direct and (not hist or _cmdb_direct["_score"] > hist.get("_score", 0.0)):
+        log.info(
+            f"CMDB Direct 勝過 DB（CMDB={_cmdb_direct['_score']:.2f} "
+            f"vs DB={hist.get('_score', 0.0):.2f}），採用 CMDB 直接派單"
+        )
+        return _build_cmdb_direct_dispatch()
+
     if hist:
         db_score = hist.get("_score", 0.0)
 
