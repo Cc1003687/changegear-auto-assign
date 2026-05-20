@@ -702,16 +702,36 @@ async def claude_assign(summary: str, description: str, requester: str,
     if not api_key or not candidates:
         return None
 
-    # 組候選工單說明
+    # ── 組候選工單說明（含 CMDB 擁有者交叉比對）──────────────────────
+    # 三信號合一：每個歷史候選的 req_item 都即時查 CMDB 註記實際擁有者，
+    # Claude 可以直接看到「歷史派給 X，但 CMDB 顯示這資產屬於 Y」的衝突，
+    # 不需多階段 fallback 也能在單次判斷中做出最佳決策。
     cand_lines = []
     for i, c in enumerate(candidates, 1):
+        # 註記該候選 req_item 在 CMDB 中的擁有者（若有）
+        cmdb_note = ""
+        if c.get("req_item"):
+            cmdb_hit = cmdb_lookup(c["req_item"])
+            if cmdb_hit:
+                cmdb_own  = (cmdb_hit.get("owner") or "").strip() or "(無)"
+                cmdb_team = (cmdb_hit.get("team_owner") or "").strip() or "(無)"
+                # 一致 / 不一致用符號標記，方便 Claude 識別衝突
+                same = (cmdb_own.lower() in c["assigned_to"].lower()
+                        or c["assigned_to"].lower() in cmdb_own.lower())
+                tag  = "✓ 一致" if same else "✗ 不一致"
+                cmdb_note = (
+                    f"\n    CMDB 比對: CI={cmdb_hit['critical_name']} "
+                    f"→ Owner(team)={cmdb_team} / Owner(person)={cmdb_own} [{tag}]"
+                )
+            else:
+                cmdb_note = f"\n    CMDB 比對: 「{c['req_item']}」未在 CMDB 中"
         cand_lines.append(
             f"[{i}] 工單:{c['ticket_id']} 相似度:{c['score']} 來源:{c['source']}\n"
             f"    標題: {c['summary']}\n"
             f"    寄件者: {c['requester']}\n"
             f"    Owner: {c['owner']} / Assigned To: {c['assigned_to']}\n"
             f"    Incident Type: {c['inc_parent']} > {c['inc_child']} > {c['inc_item']}\n"
-            f"    Requester's Item: {c['req_item']}"
+            f"    Requester's Item: {c['req_item']}{cmdb_note}"
         )
     candidates_text = "\n".join(cand_lines)
 
@@ -743,16 +763,26 @@ async def claude_assign(summary: str, description: str, requester: str,
 ## CMDB 資產清單（Requester's Item 必須從此清單中挑選）
 {req_items_text}
 
-## 規則（必須遵守）
+## 三信號決策原則（最重要）
+你的判斷會綜合三個信號：
+  ① 工單內容（標題、內文、寄件者）
+  ② 歷史相似工單（candidates 區段，每筆含過去的 owner/assigned_to）
+  ③ CMDB 資產擁有者（每個歷史候選旁邊都註記了 CMDB 比對結果）
+
+權衡優先順序：
+  - 若工單明確提到某項資產 + CMDB 有該資產 → 以 CMDB 擁有者為主
+  - 若歷史候選顯示「CMDB 比對：一致」→ 可放心採用該歷史的 assigned_to
+  - 若歷史候選顯示「CMDB 比對：不一致」→ 通常 CMDB 較可信（資產異動後人員變更），優先選 CMDB 擁有者
+  - 若 CMDB 完全沒對應 → 採用歷史最相似工單的 assigned_to
+  - 「人工修正」候選的權重最高，其次「歷史人工」，最後「bot派單」
+  - 寄件者相同的歷史候選有更高參考價值
+
+## 欄位規則
 1. inc_parent / inc_child / inc_item 必須完整照抄上方「有效的 Incident Type 清單」中的某一筆，不可自行創造或修改名稱。
-2. assigned_to 必須填入歷史工單中出現過的人員姓名，不可留空。
-3. 優先參考「人工修正」來源的工單，其次是「歷史人工」，最後才是「bot派單」。
-4. 寄件者相同的歷史工單具有較高參考價值。
-5. **req_item 必須從上方「CMDB 資產清單」中挑選最符合工單描述的資產名稱**：
-   - 工單若明確提到特定資產（系統、應用、硬體名稱），請選對應的 CMDB CI。
-   - 若工單描述模糊或找不到對應資產，留空字串。
-   - 系統會根據你選的 CI 從 CMDB 自動取得實際擁有者，因此選對 CI 很重要。
-6. 只回傳 JSON，不要任何其他文字或 markdown。
+2. assigned_to 不可留空。優先採用「CMDB 比對一致」的歷史候選對應人員；若無，採用 CMDB 反查擁有者；若 CMDB 也沒有，採用最相似的歷史候選人員。
+3. req_item 必須從上方「CMDB 資產清單」中挑選最符合工單描述的資產名稱。若工單描述模糊或無對應資產，留空字串。
+4. 系統會根據你選的 req_item 從 CMDB 反查擁有者並覆蓋你回傳的 owner/assigned_to，因此 req_item 選對非常重要。
+5. 只回傳 JSON，不要任何其他文字或 markdown。
 
 ## 回傳格式
 {{
@@ -761,9 +791,10 @@ async def claude_assign(summary: str, description: str, requester: str,
   "inc_parent": "Incident Type 第一層（照抄清單）",
   "inc_child": "Incident Type 第二層（照抄清單）",
   "inc_item": "Incident Type 第三層（照抄清單）",
-  "req_item": "Requester's Item（從清單選或填空字串）",
+  "req_item": "從 CMDB 資產清單中挑選的 CI 名稱（或空字串）",
+  "decision_source": "三信號中最關鍵的來源: 'cmdb' | 'history' | 'content' | 'hybrid'",
   "confidence": 0.0至1.0,
-  "reasoning": "判斷理由（一句話）"
+  "reasoning": "一句話說明為何選此 assigned_to（例：CMDB 與歷史一致 / CMDB 覆蓋歷史 / 內容明指）"
 }}"""
 
     # 使用者訊息（動態，每次不同 → 不快取）：新工單 + 候選清單
@@ -808,8 +839,9 @@ async def claude_assign(summary: str, description: str, requester: str,
 
         data = json.loads(raw)
         confidence = float(data.get("confidence", 0))
+        decision_src = str(data.get("decision_source", "unknown")).strip()
         log.info(
-            f"[Claude] confidence={confidence:.2f} | "
+            f"[Claude] confidence={confidence:.2f} source={decision_src} | "
             f"{data.get('reasoning','')[:80]}"
         )
 
@@ -827,14 +859,15 @@ async def claude_assign(summary: str, description: str, requester: str,
                     break
 
         return {
-            "owner":          str(data.get("owner", "")),
-            "assigned_to":    assigned_to,
-            "inc_parent":     str(data.get("inc_parent", "")),
-            "inc_child":      str(data.get("inc_child", "")),
-            "inc_item":       str(data.get("inc_item", "")),
-            "requester_item": str(data.get("req_item", "")),
-            "confidence":     confidence,
-            "_source":        f"Claude(conf={confidence:.2f})",
+            "owner":            str(data.get("owner", "")),
+            "assigned_to":      assigned_to,
+            "inc_parent":       str(data.get("inc_parent", "")),
+            "inc_child":        str(data.get("inc_child", "")),
+            "inc_item":         str(data.get("inc_item", "")),
+            "requester_item":   str(data.get("req_item", "")),
+            "decision_source":  decision_src,
+            "confidence":       confidence,
+            "_source":          f"Claude(conf={confidence:.2f},src={decision_src})",
         }
 
     except json.JSONDecodeError as e:
@@ -948,49 +981,23 @@ async def determine_assignment(summary: str, description: str = "",
         ai_result = await claude_assign(summary, description, requester, candidates)
 
         if ai_result:
-            # ── 統一決策關卡：Claude 已選 CMDB CI → 用 CI 反查實際擁有者 ─────
-            # 流程：
-            #   1. Claude 根據工單內容從 CMDB 清單挑選最符合的 CI（requester_item）
-            #   2. 系統用該 CI 名稱從 CMDB 反查 owner / team_owner
-            #   3. 若 CMDB 有對應資料 → 用 CMDB 擁有者覆蓋 Claude 的選擇
-            #   4. 若 CI 不在 CMDB 或沒有擁有者 → 沿用 Claude 自選的 owner/assigned_to
+            # ── 三信號合一：Claude 已綜合 內容 + 歷史 + CMDB 做出決策 ──────────
+            # 不再事後覆蓋。Claude 的 prompt 內每個歷史候選旁邊已標註該 CI 在
+            # CMDB 中的擁有者，Claude 已能在單次推理中比較三個信號並選擇最佳
+            # answer。系統職責只剩「執行 Claude 的決定 + 記錄三信號出處」。
             ai_conf     = ai_result.get("confidence", 0.85)
             ai_req_item = (ai_result.get("requester_item") or "").strip()
+            ai_src      = ai_result.get("decision_source", "unknown")
 
-            if ai_req_item:
-                log.info(f"  Claude 選的 CI: {ai_req_item}")
-            cmdb_hit = cmdb_lookup(ai_req_item) if ai_req_item else None
-
-            if cmdb_hit:
-                cmdb_indiv = (cmdb_hit.get("owner") or "").strip()
-                cmdb_team  = (cmdb_hit.get("team_owner") or "").strip()
-                if cmdb_indiv:
-                    final_owner    = cmdb_team or RULES.get("default_owner", "Help Desk")
-                    final_assigned = cmdb_indiv
-                    source_tag     = (
-                        f"{ai_result['_source']}+CMDB(CI={cmdb_hit['critical_name']})"
-                    )
-                    log.info(
-                        f"⚡ CMDB 反查 Owner={final_owner} / Assigned={final_assigned}"
-                        f"（覆蓋 Claude 自選）"
-                    )
-                else:
-                    # CMDB CI 存在但缺擁有者資料 → 沿用 Claude
-                    final_owner    = ai_result["owner"]
-                    final_assigned = ai_result["assigned_to"]
-                    source_tag     = f"{ai_result['_source']}(CMDB CI 無擁有者)"
-                    log.info(f"CMDB CI={ai_req_item} 無擁有者資料，沿用 Claude 自選")
-            else:
-                # Claude 未選 CI 或 CI 不在 CMDB → 沿用 Claude 自選
-                final_owner    = ai_result["owner"]
-                final_assigned = ai_result["assigned_to"]
-                source_tag     = ai_result["_source"]
-                if ai_req_item:
-                    log.info(f"Claude 選的 CI={ai_req_item} 不在 CMDB，沿用 Claude 自選")
+            log.info(
+                f"⚡ Claude 三信號決策: assigned={ai_result['assigned_to']} / "
+                f"owner={ai_result['owner']} / CI={ai_req_item or '(無)'} "
+                f"| 來源依據={ai_src} 信心={ai_conf:.2f}"
+            )
 
             return {
-                "owner":          final_owner,
-                "assigned_to":    final_assigned,
+                "owner":          ai_result["owner"],
+                "assigned_to":    ai_result["assigned_to"],
                 "inc_parent":     ai_result["inc_parent"],
                 "inc_child":      ai_result["inc_child"],
                 "inc_item":       ai_result["inc_item"],
@@ -1000,7 +1007,7 @@ async def determine_assignment(summary: str, description: str = "",
                 "priority":       _priority,
                 "due_date":       _due_date,
                 "_score":         ai_conf,
-                "_source":        source_tag,
+                "_source":        ai_result["_source"],
             }
         else:
             # Claude 信心不足（< 0.85）或呼叫失敗 → 追蹤不派單
