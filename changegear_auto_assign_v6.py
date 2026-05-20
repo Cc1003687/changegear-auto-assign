@@ -367,6 +367,28 @@ def db_get_candidates(summary: str, description: str = "", requester: str = "",
         return []
 
 
+def db_get_cmdb_critical_names() -> list[str]:
+    """
+    取得 CMDB DB 中所有 critical_name（資產名稱），提供給 Claude 作為
+    Requester's Item 的候選清單。
+
+    Claude 會從這個清單裡挑選最符合工單內容的 CI，系統再用該 CI 從
+    CMDB 反查擁有者（owner / team_owner）作為實際派單對象。
+    """
+    try:
+        conn = sqlite3.connect(CMDB_DB_PATH)
+        rows = conn.execute(
+            "SELECT critical_name FROM cmdb_items "
+            "WHERE critical_name IS NOT NULL AND critical_name != '' "
+            "ORDER BY critical_name"
+        ).fetchall()
+        conn.close()
+        return [r[0] for r in rows]
+    except Exception as e:
+        log.debug(f"db_get_cmdb_critical_names 失敗: {e}")
+        return []
+
+
 def db_get_req_items() -> list[str]:
     """取得 DB 中所有不重複的 Requester's Item，提供 Claude 選擇範圍。"""
     try:
@@ -693,9 +715,17 @@ async def claude_assign(summary: str, description: str, requester: str,
         )
     candidates_text = "\n".join(cand_lines)
 
-    # 可用的 Requester's Item 清單（限制 Claude 選項）
-    req_items = db_get_req_items()
-    req_items_text = "\n".join(f"- {r}" for r in req_items) if req_items else "（DB 尚無記錄）"
+    # ── 可選的 Requester's Item 清單（來源：CMDB DB）─────────────────
+    # 設計變更：清單來源從歷史 DB 改成 CMDB，讓 Claude 直接從實際資產
+    # 清單中挑選最符合工單內容的 CI。系統會依 Claude 選定的 CI 從
+    # CMDB 反查擁有者（owner / team_owner）作為實際派單對象。
+    cmdb_items = db_get_cmdb_critical_names()
+    if cmdb_items:
+        req_items_text = "\n".join(f"- {r}" for r in cmdb_items)
+    else:
+        # CMDB 尚未建立時退回歷史 DB（向下相容）
+        req_items = db_get_req_items()
+        req_items_text = "\n".join(f"- {r}" for r in req_items) if req_items else "（無記錄）"
 
     # 有效的 Incident Type 清單（只能從這裡選，不可自行創造）
     inc_types = db_get_incident_types()
@@ -710,7 +740,7 @@ async def claude_assign(summary: str, description: str, requester: str,
 ## 系統中有效的 Incident Type 清單（格式：第一層 > 第二層 > 第三層）
 {inc_types_text}
 
-## 可選的 Requester's Item 清單
+## CMDB 資產清單（Requester's Item 必須從此清單中挑選）
 {req_items_text}
 
 ## 規則（必須遵守）
@@ -718,7 +748,10 @@ async def claude_assign(summary: str, description: str, requester: str,
 2. assigned_to 必須填入歷史工單中出現過的人員姓名，不可留空。
 3. 優先參考「人工修正」來源的工單，其次是「歷史人工」，最後才是「bot派單」。
 4. 寄件者相同的歷史工單具有較高參考價值。
-5. req_item 請從上方清單中選擇最符合的一項；若都不符合則填空字串。
+5. **req_item 必須從上方「CMDB 資產清單」中挑選最符合工單描述的資產名稱**：
+   - 工單若明確提到特定資產（系統、應用、硬體名稱），請選對應的 CMDB CI。
+   - 若工單描述模糊或找不到對應資產，留空字串。
+   - 系統會根據你選的 CI 從 CMDB 自動取得實際擁有者，因此選對 CI 很重要。
 6. 只回傳 JSON，不要任何其他文字或 markdown。
 
 ## 回傳格式
@@ -915,104 +948,63 @@ async def determine_assignment(summary: str, description: str = "",
         ai_result = await claude_assign(summary, description, requester, candidates)
 
         if ai_result:
-            # Claude 信心 >= 0.85
-            if ai_result.get("requester_item"):
-                log.info(f"  Requester's Item (Claude): {ai_result['requester_item']}")
+            # ── 統一決策關卡：Claude 已選 CMDB CI → 用 CI 反查實際擁有者 ─────
+            # 流程：
+            #   1. Claude 根據工單內容從 CMDB 清單挑選最符合的 CI（requester_item）
+            #   2. 系統用該 CI 名稱從 CMDB 反查 owner / team_owner
+            #   3. 若 CMDB 有對應資料 → 用 CMDB 擁有者覆蓋 Claude 的選擇
+            #   4. 若 CI 不在 CMDB 或沒有擁有者 → 沿用 Claude 自選的 owner/assigned_to
+            ai_conf     = ai_result.get("confidence", 0.85)
+            ai_req_item = (ai_result.get("requester_item") or "").strip()
 
-            ai_conf = ai_result.get("confidence", 0.85)
+            if ai_req_item:
+                log.info(f"  Claude 選的 CI: {ai_req_item}")
+            cmdb_hit = cmdb_lookup(ai_req_item) if ai_req_item else None
 
-            # ── 信心 > 0.85：高信任 → 跳過 CMDB 審查直接派單 ─────────────
-            if ai_conf > 0.85:
-                log.info(
-                    f"Claude 信心 {ai_conf:.2f} > 0.85，跳過 CMDB 審查直接派單"
-                )
-                return {
-                    "owner":          ai_result["owner"],
-                    "assigned_to":    ai_result["assigned_to"],
-                    "inc_parent":     ai_result["inc_parent"],
-                    "inc_child":      ai_result["inc_child"],
-                    "inc_item":       ai_result["inc_item"],
-                    "requester_item": ai_result.get("requester_item", ""),
-                    "impact":         _impact,
-                    "urgency":        _urgency,
-                    "priority":       _priority,
-                    "due_date":       _due_date,
-                    "_score":         ai_conf,
-                    "_source":        ai_result["_source"],
-                }
-
-            # ── 信心 == 0.85：進入 CMDB 鑑別審查 ──────────────────────────
-            cmdb_ok, cmdb_reason = cmdb_validate(
-                ai_result["assigned_to"],
-                ai_result["owner"],
-                ai_result.get("requester_item", ""),
-            )
-            log.info(f"CMDB 審查 (Claude conf={ai_conf:.2f}): {cmdb_reason}")
-
-            if cmdb_ok:
-                # CMDB 審查通過 → 派單
-                return {
-                    "owner":          ai_result["owner"],
-                    "assigned_to":    ai_result["assigned_to"],
-                    "inc_parent":     ai_result["inc_parent"],
-                    "inc_child":      ai_result["inc_child"],
-                    "inc_item":       ai_result["inc_item"],
-                    "requester_item": ai_result.get("requester_item", ""),
-                    "impact":         _impact,
-                    "urgency":        _urgency,
-                    "priority":       _priority,
-                    "due_date":       _due_date,
-                    "_score":         0.85,
-                    "_source":        ai_result["_source"],
-                }
-            else:
-                # CMDB 審查不通過 → 掃 Description 中的「Hi xxx」
-                hi_name = extract_hi_name(description)
-                log.info(
-                    f"CMDB 審查不通過（Claude），掃描描述人名: "
-                    f"{'「' + hi_name + '」' if hi_name else '（未找到）'}"
-                )
-                if hi_name:
-                    second = db_find_by_name(hi_name, summary, description)
-                    if second:
-                        log.info(f"二次人名比對成功: {second['_source']}")
-                        # 二次比對採用 DB 結果，但保留 Claude 的 inc_type（較精準）
-                        return {
-                            "owner":          second["owner"],
-                            "assigned_to":    second["assigned_to"],
-                            "inc_parent":     ai_result["inc_parent"],
-                            "inc_child":      ai_result["inc_child"],
-                            "inc_item":       ai_result["inc_item"],
-                            "requester_item": second.get("requester_item", "")
-                                              or ai_result.get("requester_item", ""),
-                            "impact":         _impact,
-                            "urgency":        _urgency,
-                            "priority":       _priority,
-                            "due_date":       _due_date,
-                            "_score":         second.get("_score", 0.85),
-                            "_source":        f"{ai_result['_source']}+{second['_source']}",
-                        }
-                    else:
-                        log.warning(
-                            f"⛔ 二次人名比對信心不足（名字: {hi_name}），"
-                            f"工單僅追蹤記錄，不派單"
-                        )
-                        return None
-                else:
-                    log.warning(
-                        "⛔ CMDB 審查不通過且描述中無法提取名字（Claude mode），"
-                        "工單僅追蹤記錄，不派單"
+            if cmdb_hit:
+                cmdb_indiv = (cmdb_hit.get("owner") or "").strip()
+                cmdb_team  = (cmdb_hit.get("team_owner") or "").strip()
+                if cmdb_indiv:
+                    final_owner    = cmdb_team or RULES.get("default_owner", "Help Desk")
+                    final_assigned = cmdb_indiv
+                    source_tag     = (
+                        f"{ai_result['_source']}+CMDB(CI={cmdb_hit['critical_name']})"
                     )
-                    return None
+                    log.info(
+                        f"⚡ CMDB 反查 Owner={final_owner} / Assigned={final_assigned}"
+                        f"（覆蓋 Claude 自選）"
+                    )
+                else:
+                    # CMDB CI 存在但缺擁有者資料 → 沿用 Claude
+                    final_owner    = ai_result["owner"]
+                    final_assigned = ai_result["assigned_to"]
+                    source_tag     = f"{ai_result['_source']}(CMDB CI 無擁有者)"
+                    log.info(f"CMDB CI={ai_req_item} 無擁有者資料，沿用 Claude 自選")
+            else:
+                # Claude 未選 CI 或 CI 不在 CMDB → 沿用 Claude 自選
+                final_owner    = ai_result["owner"]
+                final_assigned = ai_result["assigned_to"]
+                source_tag     = ai_result["_source"]
+                if ai_req_item:
+                    log.info(f"Claude 選的 CI={ai_req_item} 不在 CMDB，沿用 Claude 自選")
+
+            return {
+                "owner":          final_owner,
+                "assigned_to":    final_assigned,
+                "inc_parent":     ai_result["inc_parent"],
+                "inc_child":      ai_result["inc_child"],
+                "inc_item":       ai_result["inc_item"],
+                "requester_item": ai_req_item,
+                "impact":         _impact,
+                "urgency":        _urgency,
+                "priority":       _priority,
+                "due_date":       _due_date,
+                "_score":         ai_conf,
+                "_source":        source_tag,
+            }
         else:
-            # Claude 信心不足（< 0.85）或呼叫失敗 → 嘗試 CMDB Direct fallback
-            if _cmdb_direct:
-                log.info(
-                    f"Claude 信心不足，改用 CMDB Direct 派單 | "
-                    f"{_cmdb_direct['_source']}"
-                )
-                return _build_cmdb_direct_dispatch()
-            log.warning(f"Claude 信心不足且無 CMDB Direct，工單僅追蹤不派單 | {summary[:50]}")
+            # Claude 信心不足（< 0.85）或呼叫失敗 → 追蹤不派單
+            log.warning(f"Claude 信心不足 (< 0.85)，工單僅追蹤不派單 | {summary[:50]}")
             return None
 
     # ══ 傳統模式：無 Claude API Key ═══════════════════════════════════
