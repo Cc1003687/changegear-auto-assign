@@ -608,6 +608,91 @@ def extract_hi_name(description: str) -> str:
     return ""
 
 
+def db_init_feedback_table():
+    """建立 feedback 表（人工教學紀錄）。
+    每次呼叫都是 IF NOT EXISTS，安全可重複呼叫。
+    """
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS feedback (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticket_id           TEXT,
+                summary             TEXT,
+                description         TEXT,
+                requester           TEXT,
+                req_item            TEXT,
+                wrong_owner         TEXT,
+                wrong_assigned_to   TEXT,
+                correct_owner       TEXT,
+                correct_assigned_to TEXT,
+                reason              TEXT,
+                created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def db_get_relevant_feedback(summary: str, description: str = "",
+                             req_item: str = "",
+                             top_n: int = 5,
+                             min_ratio: float = 0.30) -> list[dict]:
+    """根據新工單內容，從 feedback 表挑出 top_n 個最相關的歷史教訓。
+
+    比對策略：對每筆 feedback 計算 SequenceMatcher 相似度
+              = (summary + description + req_item) vs (feedback 的同樣三欄)
+    回傳已依相似度由高到低排序的清單；低於 min_ratio 的略過。
+
+    供 claude_assign() 注入到 user prompt，讓 Claude 在判斷時參考。
+    """
+    try:
+        db_init_feedback_table()   # 確保表存在
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            rows = conn.execute("""
+                SELECT ticket_id, summary, description, requester, req_item,
+                       wrong_owner, wrong_assigned_to,
+                       correct_owner, correct_assigned_to, reason, created_at
+                FROM feedback
+                ORDER BY created_at DESC
+            """).fetchall()
+        finally:
+            conn.close()
+
+        if not rows:
+            return []
+
+        query_text = f"{summary} {description} {req_item}".lower().strip()
+        scored = []
+        for r in rows:
+            fb_text = f"{r[1] or ''} {r[2] or ''} {r[4] or ''}".lower().strip()
+            ratio = SequenceMatcher(None, query_text, fb_text).ratio() if fb_text else 0.0
+            scored.append((ratio, r))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        out = []
+        for ratio, r in scored[:top_n]:
+            if ratio < min_ratio:
+                continue
+            out.append({
+                "ticket_id":           r[0],
+                "summary":             r[1] or "",
+                "req_item":            r[4] or "",
+                "wrong_owner":         r[5] or "",
+                "wrong_assigned_to":   r[6] or "",
+                "correct_owner":       r[7] or "",
+                "correct_assigned_to": r[8] or "",
+                "reason":              r[9] or "",
+                "similarity":          round(ratio, 2),
+            })
+        return out
+    except Exception as e:
+        log.warning(f"db_get_relevant_feedback 失敗: {e}")
+        return []
+
+
 def db_find_by_name(name: str,
                     summary: str = "", description: str = "") -> dict | None:
     """
@@ -763,7 +848,15 @@ async def claude_assign(summary: str, description: str, requester: str,
 ## CMDB 資產清單（Requester's Item 必須從此清單中挑選）
 {req_items_text}
 
-## 三信號決策原則（最重要）
+## 0. 人工教學紀錄（最高優先順序）
+若 user 訊息中含有「## ⚠ 人工教學紀錄」段落，請務必依下列原則處理：
+  - 該段落中的每筆 Lesson 是過去同類工單被 IT 主管手動修正的紀錄
+  - 若新工單與某筆 Lesson 相似（相似度高、req_item 相同、或工單性質一致），
+    必須採用該 Lesson 的「正確派給」結果，並在 reasoning 中註明參考了哪個 Lesson
+  - Lesson 的權重高於下方三信號（CMDB / 歷史 / 內容）
+  - decision_source 在此情況請填 "feedback"
+
+## 三信號決策原則（次重要）
 你的判斷會綜合三個信號：
   ① 工單內容（標題、內文、寄件者）
   ② 歷史相似工單（candidates 區段，每筆含過去的 owner/assigned_to）
@@ -792,13 +885,33 @@ async def claude_assign(summary: str, description: str, requester: str,
   "inc_child": "Incident Type 第二層（照抄清單）",
   "inc_item": "Incident Type 第三層（照抄清單）",
   "req_item": "從 CMDB 資產清單中挑選的 CI 名稱（或空字串）",
-  "decision_source": "三信號中最關鍵的來源: 'cmdb' | 'history' | 'content' | 'hybrid'",
+  "decision_source": "最關鍵來源: 'feedback' | 'cmdb' | 'history' | 'content' | 'hybrid'",
   "confidence": 0.0至1.0,
   "reasoning": "一句話說明為何選此 assigned_to（例：CMDB 與歷史一致 / CMDB 覆蓋歷史 / 內容明指）"
 }}"""
 
-    # 使用者訊息（動態，每次不同 → 不快取）：新工單 + 候選清單
-    user_text = f"""## 新工單
+    # ── 抓取人工教學紀錄（feedback）中最相關的條目 ──────────────────
+    # 使用者透過 teach.py 寫入的「應該派給誰、為什麼」會被存到 feedback 表，
+    # 這裡根據新工單內容挑出相關度最高的 5 筆注入 prompt，
+    # 讓 Claude 在判斷時優先參考過去的人工修正。
+    feedback_items = db_get_relevant_feedback(summary, description, "")
+    feedback_text  = ""
+    if feedback_items:
+        log.info(f"  注入 {len(feedback_items)} 筆人工教學紀錄到 prompt")
+        fb_lines = ["## ⚠ 人工教學紀錄（過去類似工單的修正，務必參考）"]
+        for i, f in enumerate(feedback_items, 1):
+            fb_lines.append(
+                f"[Lesson {i}] 過去工單 {f['ticket_id']}（與本工單相似度 {f['similarity']}）\n"
+                f"    工單摘要: {f['summary'][:80]}\n"
+                f"    Requester's Item: {f['req_item']}\n"
+                f"    ✗ 錯誤派給: Owner={f['wrong_owner']} / Assigned={f['wrong_assigned_to']}\n"
+                f"    ✓ 正確派給: Owner={f['correct_owner']} / Assigned={f['correct_assigned_to']}\n"
+                f"    判斷依據: {f['reason']}"
+            )
+        feedback_text = "\n".join(fb_lines) + "\n\n"
+
+    # 使用者訊息（動態，每次不同 → 不快取）：教學紀錄 + 新工單 + 候選清單
+    user_text = f"""{feedback_text}## 新工單
 - 標題（Summary）: {summary}
 - 內文（Description）: {description[:600] if description else "（無）"}
 - 寄件者（Requester）: {requester}
