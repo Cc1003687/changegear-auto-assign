@@ -1161,6 +1161,39 @@ async def select_native(page: Page, selector: str, value_map: dict, value_str: s
         log.warning(f"select_native [{label}] 失敗: {e}")
 
 
+def _extract_ad_account(name: str) -> str:
+    """從顯示名稱中萃取 AD 帳號部分，提高 Person Chooser autocomplete 命中率。
+
+    範例：
+        'wen.hsieh 謝文譯'      → 'wen.hsieh'
+        '謝文譯 wen.hsieh'      → 'wen.hsieh'
+        'Alice Wang'            → 'Alice'  （沒明顯 AD pattern 時取首段）
+        'Help Desk'             → 'Help Desk'（無空格時保留原樣）
+        '謝文譯'                → '謝文譯' （純中文時保留）
+
+    判斷規則：
+      - 整串包含空格 → 嘗試找其中「ASCII 字母開頭、含 . _ - @ 等帳號字元」的段落
+      - 找不到 AD pattern → 回傳第一個非空段落
+      - 整串無空格 → 直接回傳
+    """
+    if not name:
+        return ""
+    name = name.strip()
+    if " " not in name:
+        return name
+    parts = [p for p in name.split() if p]
+    if not parts:
+        return name
+    # AD 帳號樣式：ASCII 字母開頭，且必須含有 . _ @ - 其中之一（避免把
+    # 'Help Desk' 切成 'Help'、'Alice Wang' 切成 'Alice'）
+    ad_pat = re.compile(r"^[A-Za-z][A-Za-z0-9]*[._@\-][A-Za-z0-9._@\-]+$")
+    for p in parts:
+        if ad_pat.match(p):
+            return p
+    # 沒有 AD 帳號 pattern → 保留原字串（給 Help Desk / Alice Wang 這種）
+    return name
+
+
 async def person_chooser_fill(page: Page, input_sel: str, value: str, label: str):
     """
     PersonChooser：input 隱藏時改用 JS focus + page.keyboard.type()
@@ -1172,20 +1205,23 @@ async def person_chooser_fill(page: Page, input_sel: str, value: str, label: str
         log.debug(f"[{label}] 值為空，略過")
         return
 
+    # ── 萃取 AD 帳號（提高 autocomplete 命中率）─────────────────────
+    # CMDB 存的是 "wen.hsieh 謝文譯" 這種顯示字串，整串打進 autocomplete
+    # 通常 filter 不到。只用 AD 帳號 "wen.hsieh" 一定命中。
+    type_value = _extract_ad_account(value)
+    if type_value != value:
+        log.debug(f"[{label}] 萃取 AD 帳號: '{value}' → '{type_value}'")
+
     try:
         el_id = input_sel.lstrip("#")
         # 從 id 提取關鍵字 (e.g. 'ItemOwner' or 'AssignedTo')
-        # id = DynamicLayoutControl1_ItemOwner_PersonChooser_GridLookupPC_I
-        # parts[0]=DynamicLayoutControl1, parts[1]=ItemOwner ← 這才是關鍵字
         id_parts = el_id.split("_")
         id_key   = id_parts[1] if len(id_parts) > 1 else el_id
 
         # Step 1: JS 強制可見 + focus（精確 ID → 備援 wildcard）
         found = await page.evaluate(f"""
             (function() {{
-                // 精確 ID
                 var el = document.getElementById('{el_id}');
-                // 備援：wildcard 搜尋包含關鍵字的 GridLookupPC_I
                 if (!el) {{
                     var candidates = document.querySelectorAll('[id*="{id_key}"][id$="_I"]');
                     if (candidates.length > 0) el = candidates[0];
@@ -1202,37 +1238,44 @@ async def person_chooser_fill(page: Page, input_sel: str, value: str, label: str
             return
         await page.wait_for_timeout(300)
 
-        # Step 2: keyboard.type() 打字
-        await page.keyboard.type(value, delay=80)
+        # Step 2: keyboard.type() 打字（只打 AD 帳號）
+        await page.keyboard.type(type_value, delay=80)
         await page.wait_for_timeout(1800)
 
-        # Step 3: 點擊 dropdown 第一筆（多個 selector 嘗試）
-        matched = await page.evaluate(f"""
-            (function() {{
+        # Step 3: 點擊 dropdown 第一筆「非空」項目（驗證 textContent 非空）
+        #         避免點到 grid header 或其他空白 cell
+        matched = await page.evaluate("""
+            (function() {
                 var selectors = [
                     '.dxeListBoxItem_Sunview',
-                    'td.dxgv',
+                    '[class*="GridLookup"] td[class*="dxgv"]',
                     '.dxeListBoxItemRow td',
-                    '[class*="GridLookup"] td[class*="dxgv"]'
+                    'td.dxgv'
                 ];
-                for (var s = 0; s < selectors.length; s++) {{
+                for (var s = 0; s < selectors.length; s++) {
                     var items = document.querySelectorAll(selectors[s]);
-                    for (var i = 0; i < items.length; i++) {{
-                        if (items[i].offsetParent !== null) {{
-                            items[i].click();
-                            return 'clicked: ' + items[i].textContent.trim().substring(0, 40);
-                        }}
-                    }}
-                }}
+                    for (var i = 0; i < items.length; i++) {
+                        var el  = items[i];
+                        var txt = (el.textContent || '').trim();
+                        // 必須可見 + textContent 非空（避免點到 header/空 cell）
+                        if (el.offsetParent !== null && txt.length > 0) {
+                            el.click();
+                            return 'clicked: ' + txt.substring(0, 40);
+                        }
+                    }
+                }
                 return 'no dropdown';
-            }})();
+            })();
         """)
 
         if matched == "no dropdown":
+            # dropdown 沒出來 → 按 Enter 嘗試送出（ChangeGear 部分欄位接受）
             await page.keyboard.press("Enter")
-            log.info(f"✓ {label} (Enter): {value}")
+            log.warning(
+                f"⚠ {label}: '{type_value}' dropdown 未出現，改按 Enter（可能未真正選到人）"
+            )
         else:
-            log.info(f"✓ {label}: {value} → {matched}")
+            log.info(f"✓ {label}: '{type_value}' → {matched}")
 
     except Exception as e:
         log.warning(f"person_chooser_fill [{label}] 失敗: {e}")
