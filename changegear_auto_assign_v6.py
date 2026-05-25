@@ -1599,6 +1599,91 @@ async def click_save(page: Page) -> bool:
         return False
 
 
+async def dismiss_blocking_modals(page: Page) -> str:
+    """掃描頁面上是否有「擋住派單」的對話框（Telerik RadWindow / ASPxPopup /
+    OK-Cancel 確認框等），找到就嘗試點「OK / Yes / 確定」關閉。
+
+    回傳：偵測到並嘗試處理的對話框文字（前 100 字），找不到則回傳空字串。
+    """
+    try:
+        result = await page.evaluate("""
+            (function() {
+                // 常見的 ChangeGear / Telerik / DevExpress 對話框 selector
+                var dialogSels = [
+                    '.rwDialog:not([style*="display: none"])',
+                    '.RadWindow:not([style*="display: none"])',
+                    '.dxpc-content:not([style*="display: none"])',
+                    '[role="dialog"]:not([style*="display: none"])',
+                    '.modal.in', '.modal[style*="display: block"]'
+                ];
+                for (var s = 0; s < dialogSels.length; s++) {
+                    var dialogs = document.querySelectorAll(dialogSels[s]);
+                    for (var d = 0; d < dialogs.length; d++) {
+                        var dlg = dialogs[d];
+                        if (dlg.offsetParent === null) continue;
+                        var dlgText = (dlg.innerText || '').trim();
+                        // 嘗試找「OK / Yes / 確定 / 確認」按鈕
+                        var btns = dlg.querySelectorAll('button, input[type="button"], a.rbButton');
+                        for (var b = 0; b < btns.length; b++) {
+                            var label = (btns[b].innerText || btns[b].value || '').trim();
+                            if (/^(OK|Yes|確定|確認|Confirm)$/i.test(label)) {
+                                btns[b].click();
+                                return 'dismissed:' + dlgText.substring(0, 100);
+                            }
+                        }
+                        return 'unhandled:' + dlgText.substring(0, 100);
+                    }
+                }
+                return '';
+            })();
+        """)
+        return result or ""
+    except Exception as e:
+        log.debug(f"dismiss_blocking_modals 失敗: {e}")
+        return ""
+
+
+async def verify_dispatch_success(page: Page) -> tuple[bool, str]:
+    """
+    Accept 之後驗證工單是否真的派出去了：
+      1. Accept 按鈕是否還在（還在 = 狀態沒變 = 沒派出）
+      2. Status 欄位內容是否還是 New
+      3. 頁面是否有殘留對話框（會擋住儲存）
+    """
+    try:
+        await page.wait_for_timeout(800)   # 讓 server postback 完成
+
+        check = await page.evaluate("""
+            (function() {
+                var out = {accept_still: false, status_text: '', has_modal: false};
+                out.accept_still = !!document.getElementById('ActionBarControl1_Accept_Button');
+                // 找 Status field（ChangeGear 用 ddl 或 input）
+                var statusEl = document.querySelector('[id*="Status"][id$="_I"]')
+                            || document.querySelector('select[id*="Status"]');
+                if (statusEl) {
+                    out.status_text = statusEl.tagName === 'SELECT'
+                        ? (statusEl.options[statusEl.selectedIndex] || {}).text || ''
+                        : statusEl.value || '';
+                }
+                // 殘留 modal 檢查
+                var modals = document.querySelectorAll('.rwDialog, .RadWindow, .dxpc-content, [role="dialog"]');
+                for (var i = 0; i < modals.length; i++) {
+                    if (modals[i].offsetParent !== null) { out.has_modal = true; break; }
+                }
+                return out;
+            })();
+        """)
+
+        if check["has_modal"]:
+            return False, "頁面殘留對話框未關閉"
+        if check["accept_still"]:
+            return False, f"Accept 按鈕仍存在（status={check['status_text'] or '?'})"
+        # status 變了或找不到（找不到也可能是頁面 redirect 了 → 視為成功）
+        return True, f"狀態={check['status_text'] or '(無 Status 欄位，可能已轉 view)'}"
+    except Exception as e:
+        return False, f"verify 失敗: {e}"
+
+
 async def click_accept(page: Page) -> bool:
     """
     Accept — 在 New 狀態時點擊，同時儲存欄位並將票單轉為 In-Progress。
@@ -1622,6 +1707,17 @@ async def click_accept(page: Page) -> bool:
                 document.getElementById('ActionBarControl1_Accept_Button').click();
             """)
             await page.wait_for_load_state("networkidle", timeout=10000)
+
+            # 點擊後檢查並關閉「Are you sure?」之類的確認對話框
+            modal = await dismiss_blocking_modals(page)
+            if modal:
+                log.info(f"Accept 後對話框: {modal[:80]}")
+                # 對話框點掉之後再等網路完成
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=5000)
+                except Exception:
+                    pass
+
             log.info("✓ Accept 完成")
             return True
 
@@ -2061,6 +2157,36 @@ class ChangeGearBot:
                     await self.page.screenshot(path=f"debug_{item_id}.png")
                     log.warning(f"⚠ Save 失敗，截圖: debug_{item_id}.png")
                     return False
+            else:
+                # Accept 「點擊」成功，但要驗證狀態真的變了
+                # 之前遇過：log 寫 Accept 完成，但工單狀態仍 New（modal 沒關 / 欄位被拒）
+                ok, why = await verify_dispatch_success(self.page)
+                if not ok:
+                    log.warning(f"⚠ {item_id} Accept 點擊但狀態未變：{why}，補打 Save")
+                    # 先再清一次可能殘留的對話框
+                    modal_msg = await dismiss_blocking_modals(self.page)
+                    if modal_msg:
+                        log.info(f"  清理對話框: {modal_msg[:80]}")
+                    # 試 Save 補救
+                    saved = await click_save(self.page)
+                    if not saved:
+                        await self.page.screenshot(path=f"debug_accept_fail_{item_id}.png")
+                        log.warning(
+                            f"⚠ {item_id} Save 補救也失敗，截圖: debug_accept_fail_{item_id}.png"
+                        )
+                        return False
+                    # 補救後再驗證一次
+                    ok2, why2 = await verify_dispatch_success(self.page)
+                    if not ok2:
+                        await self.page.screenshot(path=f"debug_save_fail_{item_id}.png")
+                        log.warning(
+                            f"⚠ {item_id} 補 Save 後仍未派出：{why2}，"
+                            f"截圖: debug_save_fail_{item_id}.png"
+                        )
+                        return False
+                    log.info(f"  ✓ Save 補救成功：{why2}")
+                else:
+                    log.debug(f"  Accept 驗證通過：{why}")
 
             # ⑪ 儲存到 SQLite 歷史 DB（含 oid + requester）
             db_save(item_id, oid, summary, desc, requester, a)
