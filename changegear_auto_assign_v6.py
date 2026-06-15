@@ -9,8 +9,10 @@ ChangeGear 自動派單程式 v6
 import asyncio
 import json
 import logging
+import os
 import re
 import sqlite3
+import sys
 from datetime import datetime, timedelta
 from difflib import SequenceMatcher
 
@@ -840,7 +842,30 @@ async def claude_assign(summary: str, description: str, requester: str,
     # 系統指令（穩定，可快取）：角色、規則、有效清單、JSON 格式
     #   - 多輪呼叫之間 inc_types / req_items 與規則不變 → 命中快取，成本 ≈ 0.1×
     #   - cache_control 標記放在「最後一個穩定 block」，標記前的所有 system 一起進快取
+
+    # ── 載入 reflect.py 每週歸納的派單原則（深度學習）──────────────
+    # 若 learned_principles.md 存在且有實質內容，整份注入 system prompt 最頂端，
+    # 優先級高於人工教學紀錄。這份檔案是 Claude 從多筆 feedback/correction
+    # 歸納出的「高層派單規則」，避免 bot 重複犯類似錯誤。
+    principles_text = ""
+    if os.path.exists("learned_principles.md"):
+        try:
+            with open("learned_principles.md", encoding="utf-8") as _pf:
+                _content = _pf.read().strip()
+            # 排除「無足夠案例可歸納」這種空殼檔
+            if _content and "無足夠案例" not in _content and "## 原則" in _content:
+                principles_text = (
+                    f"\n## 已歸納原則（最高優先級，務必遵循）\n"
+                    f"以下為過去人工修正案例的歸納結果，反映本組織的派單慣例。\n"
+                    f"若新工單符合任一條原則，必須依該原則派單。\n\n"
+                    f"{_content}\n\n"
+                    f"════════════════════════════════════════════════════════\n"
+                )
+        except Exception as _e:
+            log.debug(f"載入 learned_principles.md 失敗: {_e}")
+
     system_text = f"""你是 IT 服務台的派單助理。請根據新工單資訊與歷史參考工單，判斷最合適的派單結果。
+{principles_text}
 
 ## 系統中有效的 Incident Type 清單（格式：第一層 > 第二層 > 第三層）
 {inc_types_text}
@@ -2233,6 +2258,31 @@ class ChangeGearBot:
         except Exception as e:
             log.error(f"修正掃描異常: {e}", exc_info=True)
 
+    async def run_weekly_reflection(self):
+        """每週反思：把過去 7 天的 feedback + 修正餵給 Claude，歸納派單原則
+        寫入 learned_principles.md。系統下次派單時會自動載入。
+        """
+        log.info("════ 每週反思開始 ════")
+        try:
+            import subprocess
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable, "reflect.py", "--days", "7",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await proc.communicate()
+            output = (stdout or b"").decode("utf-8", errors="replace")
+            err    = (stderr or b"").decode("utf-8", errors="replace")
+            for line in output.splitlines():
+                if line.strip():
+                    log.info(f"  [reflect] {line}")
+            if proc.returncode != 0:
+                log.warning(f"反思執行碼非 0: {proc.returncode} | stderr={err[-300:]}")
+            else:
+                log.info("════ 每週反思完成 ════")
+        except Exception as e:
+            log.error(f"每週反思異常: {e}", exc_info=True)
+
 
 # ══════════════════════════════════════════════════════════
 # 主程式
@@ -2261,6 +2311,13 @@ async def main():
         minutes=60,
         next_run_time=datetime.now() + timedelta(minutes=5),
     )
+    # 每週反思：每週一 06:00 自動跑 reflect.py 歸納派單原則
+    scheduler.add_job(
+        bot.run_weekly_reflection, "cron",
+        day_of_week="mon", hour=6, minute=0,
+    )
+    log.info("排程：派單掃描每 %d 分鐘 / 修正掃描每 60 分鐘 / 每週反思週一 06:00",
+             RULES["scan_interval"])
     scheduler.start()
 
     try:
