@@ -166,11 +166,21 @@ def init_db():
     # 舊版 DB 補欄位（PRAGMA 確認不存在才 ALTER，避免 exception 被吞）
     existing_cols = {r[1] for r in conn.execute("PRAGMA table_info(assignments)").fetchall()}
     for col, defn in [
-        ("oid",          "TEXT DEFAULT ''"),
-        ("requester",    "TEXT DEFAULT ''"),
-        ("bot_assigned", "INTEGER DEFAULT 0"),
-        ("corrected",    "INTEGER DEFAULT 0"),
-        ("updated_at",   "TIMESTAMP DEFAULT ''"),
+        ("oid",                  "TEXT DEFAULT ''"),
+        ("requester",            "TEXT DEFAULT ''"),
+        ("bot_assigned",         "INTEGER DEFAULT 0"),
+        ("corrected",            "INTEGER DEFAULT 0"),
+        ("updated_at",           "TIMESTAMP DEFAULT ''"),
+        # ── stats.py 用：bot 原本派的值（被 correction_scan 覆蓋前的快照）──
+        ("original_owner",       "TEXT DEFAULT ''"),
+        ("original_assigned_to", "TEXT DEFAULT ''"),
+        ("original_inc_parent",  "TEXT DEFAULT ''"),
+        ("original_inc_child",   "TEXT DEFAULT ''"),
+        ("original_inc_item",    "TEXT DEFAULT ''"),
+        ("original_req_item",    "TEXT DEFAULT ''"),
+        # ── stats.py 用：決策來源與信心度 ──
+        ("decision_source",      "TEXT DEFAULT ''"),
+        ("confidence",           "REAL DEFAULT 0.0"),
     ]:
         if col not in existing_cols:
             conn.execute(f"ALTER TABLE assignments ADD COLUMN {col} {defn}")
@@ -213,19 +223,44 @@ def db_save(ticket_id: str, oid: str, summary: str, description: str,
     """
     try:
         conn = sqlite3.connect(DB_PATH)
+        # _source 從 determine_assignment 帶過來的字串裡可能含 "Claude(conf=0.92,src=cmdb)"
+        # 抽取 src= 後面那個詞當 decision_source
+        src_str = a.get("_source", "")
+        m_src   = re.search(r"src=([a-zA-Z]+)", src_str)
+        decision_source = m_src.group(1) if m_src else (
+            "cmdb" if "CMDB" in src_str else
+            "claude" if "Claude" in src_str else
+            "db" if "DB:" in src_str else
+            "excel" if "Excel" in src_str else
+            "default" if "預設" in src_str else
+            ""
+        )
+        confidence = float(a.get("_score", 0.0) or 0.0)
+
         conn.execute("""
             INSERT OR REPLACE INTO assignments
             (ticket_id, oid, summary, description, requester,
              owner, assigned_to, inc_parent, inc_child, inc_item, req_item,
+             original_owner, original_assigned_to,
+             original_inc_parent, original_inc_child, original_inc_item, original_req_item,
+             decision_source, confidence,
              bot_assigned, corrected, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, CURRENT_TIMESTAMP)
-        """, (ticket_id, oid, summary, description[:500], requester,
-              a["owner"], a["assigned_to"],
-              a["inc_parent"], a["inc_child"], a["inc_item"],
-              a.get("requester_item", "")))
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?,
+                    ?, ?,
+                    1, 0, CURRENT_TIMESTAMP)
+        """, (
+            ticket_id, oid, summary, description[:500], requester,
+            a["owner"], a["assigned_to"],
+            a["inc_parent"], a["inc_child"], a["inc_item"], a.get("requester_item", ""),
+            # original_* 與 owner/inc_* 同步寫入，作為 bot 原始選擇的快照
+            a["owner"], a["assigned_to"],
+            a["inc_parent"], a["inc_child"], a["inc_item"], a.get("requester_item", ""),
+            decision_source, confidence,
+        ))
         conn.commit()
         conn.close()
-        log.debug(f"已儲存歷史記錄: {ticket_id}")
+        log.debug(f"已儲存歷史記錄: {ticket_id} (source={decision_source}, conf={confidence:.2f})")
     except Exception as e:
         log.warning(f"DB 儲存失敗: {e}")
 
