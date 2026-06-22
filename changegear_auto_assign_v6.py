@@ -1926,6 +1926,51 @@ class ChangeGearBot:
             "req_item":    await val(f"[id*='ImpactedResourcesPIT'][id*='dropDownTextBox_I']"),
         }
 
+    @staticmethod
+    def _is_real_correction(field: str, db_v: str, cur_v: str) -> bool:
+        """判斷某欄位的「DB 值 → 現值」是否算「真修正」。
+
+        排除以下三種「假修正」：
+          1. Req Item 多值補資料：bot 填了 A，人工新增 A;B → 不算修正
+          2. Owner / Assigned 顯示變體：bot=`wen.hsieh`，現值=`wen.hsieh 謝文譯`
+             → 子字串相符，視為同一人
+          3. Inc 欄位被動補資料：bot 留空白，人工後補 → 不算修正
+        """
+        db_v  = (db_v or "").strip()
+        cur_v = (cur_v or "").strip()
+
+        # 現值空 → 頁面未載入或欄位被清除，保守不算
+        if not cur_v:
+            return False
+        if db_v == cur_v:
+            return False
+
+        # ── Req Item: 多值（分號或逗號分隔）──────────────────
+        # bot 值若是現值的子集（例：bot=A，現值=A;B）→ 人工補了第二項，不算修正
+        if field == "req_item":
+            if not db_v:
+                return False                 # bot 留空 → 人工後補 → 不算
+            db_items  = {x.strip().lower() for x in re.split(r"[;,]", db_v)  if x.strip()}
+            cur_items = {x.strip().lower() for x in re.split(r"[;,]", cur_v) if x.strip()}
+            if db_items.issubset(cur_items):
+                return False                  # 只是新增項目
+            return True
+
+        # ── Owner / Assigned: 子字串比對（顯示變體）─────────
+        # 例：bot=`wen.hsieh`、現值=`wen.hsieh 謝文譯` → 同一人
+        if field in ("owner", "assigned_to"):
+            dl = db_v.lower()
+            cl = cur_v.lower()
+            if dl in cl or cl in dl:
+                return False
+            return True
+
+        # ── Inc Parent / Child / Item: bot 留空白 + 人工補 → 不算 ──
+        if not db_v:
+            return False
+        return True
+
+
     async def scan_and_learn_corrections(self):
         """掃描 bot 近期派單，偵測人工修正並回寫 DB 學習。
 
@@ -1978,17 +2023,24 @@ class ChangeGearBot:
 
                 cur = await self.read_current_assignment()
 
-                # 比較有無差異（忽略空值欄位）
+                # 比較有無差異 — 用新版 helper 過濾掉「補資料 / 顯示變體」
                 diffs = {}
+                soft_diffs = {}      # 有變但不算修正（補資料等）
                 for k in ("owner", "assigned_to", "inc_parent", "inc_child",
                           "inc_item", "req_item"):
                     db_v  = (db_vals[k] or "").strip()
                     cur_v = (cur[k] or "").strip()
                     if cur_v and cur_v != db_v:
-                        diffs[k] = {"was": db_v, "now": cur_v}
+                        if self._is_real_correction(k, db_v, cur_v):
+                            diffs[k] = {"was": db_v, "now": cur_v}
+                        else:
+                            soft_diffs[k] = {"was": db_v, "now": cur_v}
 
                 if not diffs:
-                    log.debug(f"{ticket_id}: 無修正")
+                    if soft_diffs:
+                        log.debug(f"{ticket_id}: 軟修正（不算）: {soft_diffs}")
+                    else:
+                        log.debug(f"{ticket_id}: 無修正")
                     continue
 
                 # 有差異 → 人工修正了，更新 DB
