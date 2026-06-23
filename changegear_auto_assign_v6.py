@@ -1079,8 +1079,10 @@ Wen.Hsieh 是組織內的派單權威，她最後 Save/Accept 過的歷史單代
             f"{data.get('reasoning','')[:80]}"
         )
 
-        if confidence < 0.85:
-            log.warning(f"Claude 信心不足 ({confidence:.2f} < 0.85)，降回傳統邏輯")
+        # Sonnet 4.6 自評偏保守，0.75–0.85 區間實測答案多半正確 → 門檻設為 0.75
+        # 若信心真的很低 (<0.75) → 不派，留給人工或 CMDB Direct fallback
+        if confidence < 0.75:
+            log.warning(f"Claude 信心不足 ({confidence:.2f} < 0.75)，降回傳統邏輯")
             return None
 
         assigned_to = str(data.get("assigned_to", "")).strip()
@@ -1127,12 +1129,12 @@ async def determine_assignment(summary: str, description: str = "",
     """派單決策引擎（AI / 傳統模式皆含 CMDB 鑑別審查層）。
 
     AI 模式（Claude API Key 已設定）：
-      ① Claude AI（信心 >= 0.85）→ 進入 CMDB 審查
-           CMDB 審查通過 → 派單
-           CMDB 審查不通過 → 掃 Description「Hi xxx」→ 二次人名 DB 比對
-             二次信心 >= 0.85 → 採用（owner/assigned_to 用 DB 結果，inc_type 保留 Claude）
-             二次信心 < 0.85  → 回傳 None（追蹤不派單）
-      ② Claude 信心不足（< 0.85）或呼叫失敗 → 回傳 None
+      ① Claude AI（信心 >= 0.75）→ 派單（Claude prompt 內已含 CMDB 註記 + Wen 驗證等三信號）
+           - Sonnet 4.6 自評偏保守，0.75–0.85 區間實測答案多半正確
+           - Claude 已綜合 內容 + 歷史候選 + CMDB 擁有者 做出單一決策，不再事後覆蓋
+      ② Claude 信心不足（< 0.75）或呼叫失敗
+           - 若 CMDB Direct 候選存在 → 用 CMDB Direct 派單
+           - 否則 → 追蹤不派單
 
     傳統模式（無 Claude API Key）：
       ① SQLite 歷史比對（分數 >= db_similarity）
@@ -1244,8 +1246,11 @@ async def determine_assignment(summary: str, description: str = "",
                 "_source":        ai_result["_source"],
             }
         else:
-            # Claude 信心不足（< 0.85）或呼叫失敗 → 追蹤不派單
-            log.warning(f"Claude 信心不足 (< 0.85)，工單僅追蹤不派單 | {summary[:50]}")
+            # Claude 信心不足（< 0.75）或呼叫失敗 → 嘗試 CMDB Direct fallback，否則追蹤不派單
+            if _cmdb_direct:
+                log.info(f"Claude 信心不足，改用 CMDB Direct 派單 | {_cmdb_direct['_source']}")
+                return _build_cmdb_direct_dispatch()
+            log.warning(f"Claude 信心不足 (< 0.75) 且無 CMDB Direct 候選，工單僅追蹤不派單 | {summary[:50]}")
             return None
 
     # ══ 傳統模式：無 Claude API Key ═══════════════════════════════════
