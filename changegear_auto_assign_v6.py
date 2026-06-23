@@ -1557,7 +1557,13 @@ async def set_due_date(page: Page, date_str: str):
 
 
 async def set_incident_type(page: Page, level1: str, level2: str, level3: str):
-    """Telerik RadTreeView — 全程 JS，繞過可見性限制"""
+    """Telerik RadTreeView 多層下拉 — 全程 JS，繞過可見性限制。
+
+    重要：「Applications」「Infrastructure」之類的 L2 名稱會在多個 L1
+    底下重複出現（Error or Failure / IT2IT Request / Service Request 都有
+    Applications 子節點）。所以 L2/L3 必須**限縮在 L1 的子樹內**搜尋，
+    不能用全頁 textContent 抓第一個。
+    """
     try:
         # 開啟下拉
         await page.evaluate("""
@@ -1575,53 +1581,136 @@ async def set_incident_type(page: Page, level1: str, level2: str, level3: str):
         """)
         await page.wait_for_timeout(1000)
 
-        async def js_expand(text: str) -> bool:
+        # ── L1：在全頁範圍找，展開 + 等子節點 AJAX 載入 ─────────────
+        async def js_expand_l1(text: str) -> bool:
             result = await page.evaluate(f"""
                 (function() {{
                     var spans = document.querySelectorAll('span.rtIn');
                     for (var i = 0; i < spans.length; i++) {{
                         if (spans[i].textContent.trim() === '{text}') {{
                             var li = spans[i].closest('li');
-                            if (!li) {{ spans[i].click(); return 'clicked text (no li)'; }}
-                            var plus = li.querySelector('span.rtPlus, span.rtExpand, .rtIcon');
-                            if (plus) {{ plus.click(); return 'clicked plus'; }}
-                            spans[i].click(); return 'clicked text';
+                            if (!li) {{ spans[i].click(); return 'no-li'; }}
+                            // 若已展開（rtMinus 圖示存在）→ 不再點，避免折疊
+                            if (li.querySelector('.rtMinus')) return 'already-expanded';
+                            var plus = li.querySelector('span.rtPlus, span.rtExpand');
+                            if (plus) {{ plus.click(); return 'clicked-plus'; }}
+                            spans[i].click(); return 'clicked-text';
+                        }}
+                    }}
+                    return 'not found';
+                }})();
+            """)
+            await page.wait_for_timeout(800)   # 等 AJAX 載入子節點
+            if result == "not found":
+                log.warning(f"L1 找不到節點: {text}")
+                return False
+            return True
+
+        # ── L2：限縮在 L1 的 li 子樹內搜尋（避免抓到其他 L1 底下同名節點）──
+        async def js_expand_l2(l1_text: str, l2_text: str) -> bool:
+            result = await page.evaluate(f"""
+                (function() {{
+                    // 1. 找到 L1 的 li
+                    var spans = document.querySelectorAll('span.rtIn');
+                    var l1Li = null;
+                    for (var i = 0; i < spans.length; i++) {{
+                        if (spans[i].textContent.trim() === '{l1_text}') {{
+                            l1Li = spans[i].closest('li');
+                            break;
+                        }}
+                    }}
+                    if (!l1Li) return 'no l1';
+                    // 2. 只在 L1 的子節點內找 L2
+                    var childSpans = l1Li.querySelectorAll('ul span.rtIn');
+                    for (var i = 0; i < childSpans.length; i++) {{
+                        if (childSpans[i].textContent.trim() === '{l2_text}') {{
+                            var li = childSpans[i].closest('li');
+                            if (!li) {{ childSpans[i].click(); return 'no-li'; }}
+                            if (li.querySelector('.rtMinus')) return 'already-expanded';
+                            var plus = li.querySelector('span.rtPlus, span.rtExpand');
+                            if (plus) {{ plus.click(); return 'clicked-plus'; }}
+                            childSpans[i].click(); return 'clicked-text';
+                        }}
+                    }}
+                    return 'not found';
+                }})();
+            """)
+            await page.wait_for_timeout(700)
+            if result in ("no l1", "not found"):
+                log.warning(f"L2 找不到節點: {l1_text} > {l2_text} (result={result})")
+                return False
+            return True
+
+        # ── L3：同樣限縮在 L1+L2 子樹內 ──
+        async def js_click_l3(l1_text: str, l2_text: str, l3_text: str) -> bool:
+            result = await page.evaluate(f"""
+                (function() {{
+                    var spans = document.querySelectorAll('span.rtIn');
+                    var l1Li = null;
+                    for (var i = 0; i < spans.length; i++) {{
+                        if (spans[i].textContent.trim() === '{l1_text}') {{
+                            l1Li = spans[i].closest('li');
+                            break;
+                        }}
+                    }}
+                    if (!l1Li) return 'no l1';
+                    var l2Spans = l1Li.querySelectorAll('ul span.rtIn');
+                    var l2Li = null;
+                    for (var i = 0; i < l2Spans.length; i++) {{
+                        if (l2Spans[i].textContent.trim() === '{l2_text}') {{
+                            l2Li = l2Spans[i].closest('li');
+                            break;
+                        }}
+                    }}
+                    if (!l2Li) return 'no l2';
+                    var l3Spans = l2Li.querySelectorAll('ul span.rtIn');
+                    for (var i = 0; i < l3Spans.length; i++) {{
+                        if (l3Spans[i].textContent.trim() === '{l3_text}') {{
+                            l3Spans[i].click(); return 'clicked';
                         }}
                     }}
                     return 'not found';
                 }})();
             """)
             await page.wait_for_timeout(500)
-            if result == "not found":
-                log.warning(f"JS 找不到節點: {text}")
+            if result != "clicked":
+                log.warning(f"L3 找不到節點: {l1_text} > {l2_text} > {l3_text} (result={result})")
                 return False
             return True
 
-        async def js_click_leaf(text: str) -> bool:
-            result = await page.evaluate(f"""
-                (function() {{
-                    var spans = document.querySelectorAll('span.rtIn');
-                    for (var i = 0; i < spans.length; i++) {{
-                        if (spans[i].textContent.trim() === '{text}') {{
-                            spans[i].click(); return 'clicked';
+        # ── 真正執行：L3 為空字串時跳過（很多 Incident Type 只有兩層）──
+        ok1 = await js_expand_l1(level1)
+        ok2 = await js_expand_l2(level1, level2) if ok1 else False
+        if level3 and level3.strip():
+            ok3 = await js_click_l3(level1, level2, level3) if ok2 else False
+        else:
+            # L3 空 → 直接點 L2 葉子完成選取
+            ok3 = True
+            if ok2:
+                await page.evaluate(f"""
+                    (function() {{
+                        var spans = document.querySelectorAll('span.rtIn');
+                        for (var i = 0; i < spans.length; i++) {{
+                            var li = spans[i].closest('li');
+                            if (!li) continue;
+                            var pLi = li.parentElement && li.parentElement.closest('li');
+                            if (!pLi) continue;
+                            var pSpan = pLi.querySelector(':scope > div span.rtIn, :scope > span.rtIn');
+                            if (pSpan && pSpan.textContent.trim() === '{level1}'
+                                && spans[i].textContent.trim() === '{level2}') {{
+                                spans[i].click(); return;
+                            }}
                         }}
-                    }}
-                    return 'not found';
-                }})();
-            """)
-            await page.wait_for_timeout(400)
-            return result != "not found"
-
-        ok1 = await js_expand(level1)
-        ok2 = await js_expand(level2)
-        ok3 = await js_click_leaf(level3)
+                    }})();
+                """)
+                await page.wait_for_timeout(400)
 
         if ok1 and ok2 and ok3:
-            log.info(f"✓ Incident Type: {level1} > {level2} > {level3}")
+            log.info(f"✓ Incident Type: {level1} > {level2} > {level3 or '(無L3)'}")
         else:
             log.warning(f"Incident Type 節點部分未找到 (l1={ok1} l2={ok2} l3={ok3})")
 
-        # 收起下拉樹：用 Escape 鍵，避免 mouse.click 誤按 Action Bar 上的 Accept/Save 等按鈕
+        # 收起下拉樹
         await page.keyboard.press("Escape")
         await page.wait_for_timeout(300)
     except Exception as e:
