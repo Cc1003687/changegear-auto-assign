@@ -972,14 +972,26 @@ Wen.Hsieh 是組織內的派單權威，她最後 Save/Accept 過的歷史單代
 {{
   "owner": "負責人",
   "assigned_to": "指派人員（不可空白）",
-  "inc_parent": "Incident Type 第一層（照抄清單）",
-  "inc_child": "Incident Type 第二層（照抄清單）",
-  "inc_item": "Incident Type 第三層（照抄清單）",
+  "inc_parent": "Incident Type 第一層名稱（單一名稱，不可含 ' > ' 串接）",
+  "inc_child": "Incident Type 第二層名稱（單一名稱，不可含 ' > ' 串接）",
+  "inc_item": "Incident Type 第三層名稱（單一名稱；無第三層時填空字串）",
   "req_item": "從 CMDB 資產清單中挑選的 CI 名稱（或空字串）",
-  "decision_source": "最關鍵來源: 'feedback' | 'cmdb' | 'history' | 'content' | 'hybrid'",
+  "decision_source": "最關鍵來源: 'feedback' | 'cmdb' | 'history' | 'content' | 'hybrid' | 'wen_blessed'",
   "confidence": 0.0至1.0,
-  "reasoning": "一句話說明為何選此 assigned_to（例：CMDB 與歷史一致 / CMDB 覆蓋歷史 / 內容明指）"
-}}"""
+  "reasoning": "一句話說明為何選此 assigned_to"
+}}
+
+## 【重要範例 — inc_parent / inc_child / inc_item 格式】
+正確：
+  "inc_parent": "IT2IT Request",
+  "inc_child":  "Applications",
+  "inc_item":   ""
+
+錯誤（不要串接路徑）：
+  "inc_child":  "IT2IT Request > Applications"   ❌
+  "inc_child":  "IT2IT Request: Applications"    ❌
+  "inc_item":   "IT2IT Request > Applications"   ❌
+每個欄位都只填單一層的名稱，不含分隔符或上層名稱。"""
 
     # ── 抓取人工教學紀錄（feedback）中最相關的條目 ──────────────────
     # 使用者透過 teach.py 寫入的「應該派給誰、為什麼」會被存到 feedback 表，
@@ -1094,12 +1106,25 @@ Wen.Hsieh 是組織內的派單權威，她最後 Save/Accept 過的歷史單代
                     log.warning(f"Claude assigned_to 空白，補入候選值: {assigned_to}")
                     break
 
+        # 防禦性：Claude 偶爾會在 inc_* 欄位塞入「A > B」之類的路徑串接
+        # 若偵測到分隔符，取最後一段（最具體的那層）
+        def _last_segment(val: str) -> str:
+            s = str(val or "").strip()
+            for sep in (" > ", " >", "> ", ">", " : ", ": "):
+                if sep in s:
+                    parts = [p.strip() for p in s.split(sep) if p.strip()]
+                    if parts:
+                        # log 變更才追蹤得到
+                        log.debug(f"inc_* 防禦切割: {s!r} -> {parts[-1]!r}")
+                        return parts[-1]
+            return s
+
         return {
             "owner":            str(data.get("owner", "")),
             "assigned_to":      assigned_to,
-            "inc_parent":       str(data.get("inc_parent", "")),
-            "inc_child":        str(data.get("inc_child", "")),
-            "inc_item":         str(data.get("inc_item", "")),
+            "inc_parent":       _last_segment(data.get("inc_parent", "")),
+            "inc_child":        _last_segment(data.get("inc_child", "")),
+            "inc_item":         _last_segment(data.get("inc_item", "")),
             "requester_item":   str(data.get("req_item", "")),
             "decision_source":  decision_src,
             "confidence":       confidence,
