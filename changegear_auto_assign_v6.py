@@ -181,6 +181,9 @@ def init_db():
         # ── stats.py 用：決策來源與信心度 ──
         ("decision_source",      "TEXT DEFAULT ''"),
         ("confidence",           "REAL DEFAULT 0.0"),
+        # ── 「Wen 驗證」機制：從 ChangeGear 審計記錄抓最後 Save/Accept 者 ──
+        ("last_saver",           "TEXT DEFAULT ''"),
+        ("is_wen_blessed",       "INTEGER DEFAULT 0"),
     ]:
         if col not in existing_cols:
             conn.execute(f"ALTER TABLE assignments ADD COLUMN {col} {defn}")
@@ -281,7 +284,8 @@ def db_find_similar(summary: str, description: str = "", requester: str = "") ->
         conn = sqlite3.connect(DB_PATH)
         rows = conn.execute(
             "SELECT ticket_id, summary, description, requester, owner, assigned_to, "
-            "inc_parent, inc_child, inc_item, req_item, bot_assigned, corrected "
+            "inc_parent, inc_child, inc_item, req_item, bot_assigned, corrected, "
+            "is_wen_blessed "
             "FROM assignments "
             "ORDER BY created_at DESC LIMIT 500"
         ).fetchall()
@@ -319,7 +323,10 @@ def db_find_similar(summary: str, description: str = "", requester: str = "") ->
             else:
                 trust_bonus = 1.00      # bot 派但未被驗證，不額外加分
 
-            score = min(1.0, (text_ratio * 0.70 + req_bonus) * trust_bonus)
+            # ④ Wen 驗證加權（wen.hsieh 最後 Save/Accept 過 → ×2）
+            wen_bonus = 2.0 if row[12] else 1.0
+
+            score = min(1.0, (text_ratio * 0.70 + req_bonus) * trust_bonus * wen_bonus)
 
             if score > best_score:
                 best_score = score
@@ -332,6 +339,8 @@ def db_find_similar(summary: str, description: str = "", requester: str = "") ->
                 "歷史人工" if not best_row[10] else
                 "bot派單"
             )
+            if best_row[12]:
+                trust_label += "+Wen驗證"
             log.info(f"歷史比對命中 [{trust_label}] (score={best_score:.2f}): {best_row[0]}")
             return {
                 "owner":          best_row[4],
@@ -359,7 +368,8 @@ def db_get_candidates(summary: str, description: str = "", requester: str = "",
         conn = sqlite3.connect(DB_PATH)
         rows = conn.execute(
             "SELECT ticket_id, summary, description, requester, owner, assigned_to, "
-            "inc_parent, inc_child, inc_item, req_item, bot_assigned, corrected "
+            "inc_parent, inc_child, inc_item, req_item, bot_assigned, corrected, "
+            "is_wen_blessed "
             "FROM assignments ORDER BY created_at DESC LIMIT 300"
         ).fetchall()
         conn.close()
@@ -379,12 +389,17 @@ def db_get_candidates(summary: str, description: str = "", requester: str = "",
                 elif req_lower in hist_req or hist_req in req_lower:
                     req_bonus = 0.15
             trust = 1.20 if row[11] else (1.10 if not row[10] else 1.00)
-            score = min(1.0, (text_ratio * 0.70 + req_bonus) * trust)
+            # Wen 驗證機制：wen.hsieh 最後 Save/Accept 過的歷史單 ×2
+            wen_bonus = 2.0 if row[12] else 1.0
+            score = min(1.0, (text_ratio * 0.70 + req_bonus) * trust * wen_bonus)
             scored.append((score, row))
 
         scored.sort(key=lambda x: x[0], reverse=True)
         result = []
         for score, row in scored[:top_n]:
+            base_source = "人工修正" if row[11] else ("歷史人工" if not row[10] else "bot派單")
+            wen_blessed = bool(row[12])
+            source = f"{base_source}+Wen驗證" if wen_blessed else base_source
             result.append({
                 "ticket_id":   row[0],
                 "summary":     row[1],
@@ -395,7 +410,8 @@ def db_get_candidates(summary: str, description: str = "", requester: str = "",
                 "inc_child":   row[7],
                 "inc_item":    row[8],
                 "req_item":    row[9] or "",
-                "source":      "人工修正" if row[11] else ("歷史人工" if not row[10] else "bot派單"),
+                "source":      source,
+                "wen_blessed": wen_blessed,
                 "score":       round(score, 3),
             })
         return result
@@ -830,6 +846,8 @@ async def claude_assign(summary: str, description: str, requester: str,
     # 不需多階段 fallback 也能在單次判斷中做出最佳決策。
     cand_lines = []
     for i, c in enumerate(candidates, 1):
+        # Wen 驗證標記（最高優先級指示符）
+        wen_marker = "🌟[Wen.Hsieh 最後驗證 — 此為派單黃金標準] " if c.get("wen_blessed") else ""
         # 註記該候選 req_item 在 CMDB 中的擁有者（若有）
         cmdb_note = ""
         if c.get("req_item"):
@@ -848,7 +866,7 @@ async def claude_assign(summary: str, description: str, requester: str,
             else:
                 cmdb_note = f"\n    CMDB 比對: 「{c['req_item']}」未在 CMDB 中"
         cand_lines.append(
-            f"[{i}] 工單:{c['ticket_id']} 相似度:{c['score']} 來源:{c['source']}\n"
+            f"[{i}] {wen_marker}工單:{c['ticket_id']} 相似度:{c['score']} 來源:{c['source']}\n"
             f"    標題: {c['summary']}\n"
             f"    寄件者: {c['requester']}\n"
             f"    Owner: {c['owner']} / Assigned To: {c['assigned_to']}\n"
@@ -908,7 +926,16 @@ async def claude_assign(summary: str, description: str, requester: str,
 ## CMDB 資產清單（Requester's Item 必須從此清單中挑選）
 {req_items_text}
 
-## 0. 人工教學紀錄（最高優先順序）
+## ⭐ 最高優先級：Wen.Hsieh 驗證規則
+某些歷史候選會標註「🌟[Wen.Hsieh 最後驗證 — 此為派單黃金標準]」。
+Wen.Hsieh 是組織內的派單權威，她最後 Save/Accept 過的歷史單代表「組織認可的標準派法」。
+判斷新工單時，必須優先參考這些標註過的候選：
+  - 若有任何 Wen 驗證候選與新工單相似（相似度 ≥ 0.50 或 Req Item / 主題相同），
+    必須採用其 Owner / Assigned To / Incident Type 設定
+  - 此規則優先於下方「人工教學紀錄」與「三信號決策」
+  - 此情況下 decision_source 填 "wen_blessed"
+
+## 0. 人工教學紀錄（次高優先順序）
 若 user 訊息中含有「## ⚠ 人工教學紀錄」段落，請務必依下列原則處理：
   - 該段落中的每筆 Lesson 是過去同類工單被 IT 主管手動修正的紀錄
   - 若新工單與某筆 Lesson 相似（相似度高、req_item 相同、或工單性質一致），
@@ -1926,6 +1953,52 @@ class ChangeGearBot:
             "req_item":    await val(f"[id*='ImpactedResourcesPIT'][id*='dropDownTextBox_I']"),
         }
 
+    # ── Wen 驗證機制 ────────────────────────────────────────────
+    # wen.hsieh 是組織內派單的「黃金標準」，她最後 Save/Accept 的歷史單
+    # 在相似度比對中享有 ×2 權重，讓 bot 以她的派單方式為首要參考。
+    WEN_AUTHORITY_NAMES = ("wen.hsieh", "謝文譯")
+
+    @classmethod
+    def _is_wen(cls, name: str) -> bool:
+        if not name:
+            return False
+        n = name.lower()
+        return any(w.lower() in n for w in cls.WEN_AUTHORITY_NAMES)
+
+    async def read_last_saver(self, page: Page) -> str:
+        """從 ticket detail 頁讀取最後一個 Save / Accept 動作的執行者姓名。
+
+        ChangeGear 的審計記錄區塊（History/Activity Log）通常列在頁面下方，
+        每列 3 欄：使用者 / 時間 / 動作（Save / Accept / Submit / Create / Description）。
+        新→舊排序，第一筆就是最後動作。
+
+        此函式以最寬鬆的方式嘗試多種 selector，找不到時回傳空字串。
+        """
+        try:
+            return await page.evaluate("""
+                (function() {
+                    // 1) 找包含 Save/Accept 字樣的 table row
+                    var rows = document.querySelectorAll(
+                        'table tr, .rgMasterTable tr, .RadGrid tr, ' +
+                        '[id*="History"] tr, [id*="Audit"] tr, ' +
+                        '[id*="Activity"] tr, [class*="History"] tr'
+                    );
+                    for (var i = 0; i < rows.length; i++) {
+                        var tds = rows[i].querySelectorAll('td');
+                        if (tds.length < 3) continue;
+                        var actionCell = (tds[tds.length-1].innerText || '').trim();
+                        // 第一筆 (新→舊排序) 且動作是 Save / Accept
+                        if (/^(Save|Accept|Update)$/i.test(actionCell)) {
+                            return (tds[0].innerText || '').trim();
+                        }
+                    }
+                    return '';
+                })();
+            """)
+        except Exception as e:
+            log.debug(f"read_last_saver 失敗: {e}")
+            return ""
+
     @staticmethod
     def _is_real_correction(field: str, db_v: str, cur_v: str) -> bool:
         """判斷某欄位的「DB 值 → 現值」是否算「真修正」。
@@ -2022,6 +2095,23 @@ class ChangeGearBot:
                 await self.page.wait_for_timeout(1500)
 
                 cur = await self.read_current_assignment()
+
+                # 順便讀「最後 Save/Accept 者」用於 Wen 驗證機制
+                last_saver = await self.read_last_saver(self.page)
+                wen_blessed = 1 if self._is_wen(last_saver) else 0
+                if last_saver:
+                    log.debug(f"{ticket_id} 最後 Saver: {last_saver} (wen={wen_blessed})")
+                    # 不論 corrected 與否，每次都更新 last_saver
+                    try:
+                        c2 = sqlite3.connect(DB_PATH)
+                        c2.execute(
+                            "UPDATE assignments SET last_saver=?, is_wen_blessed=? WHERE ticket_id=?",
+                            (last_saver, wen_blessed, ticket_id),
+                        )
+                        c2.commit()
+                        c2.close()
+                    except Exception as e:
+                        log.debug(f"last_saver 寫入失敗: {e}")
 
                 # 比較有無差異 — 用新版 helper 過濾掉「補資料 / 顯示變體」
                 diffs = {}
