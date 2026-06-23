@@ -79,8 +79,9 @@ async def main():
                 await bot.page.goto(url, wait_until="domcontentloaded", timeout=20000)
                 await bot.page.wait_for_timeout(1200)
 
-                last_saver = await bot.read_last_saver(bot.page)
-                wen = 1 if bot._is_wen(last_saver) else 0
+                signals = await bot.read_audit_signals(bot.page)
+                last_saver = signals["last_saver"]
+                wen = 1 if signals["wen_touched"] else 0
 
                 conn = sqlite3.connect(DB_PATH)
                 conn.execute(
@@ -96,7 +97,7 @@ async def main():
                 elif not last_saver:
                     unknown_count += 1
 
-                tag = "🌟Wen" if wen else (last_saver or "?")
+                tag = "🌟Wen碰過" if wen else (last_saver or "?")
                 print(f"  [{i:4d}/{total}] {ticket_id}  →  {tag}")
 
             except Exception as e:

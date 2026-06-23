@@ -2033,6 +2033,61 @@ class ChangeGearBot:
             log.debug(f"read_last_saver 失敗: {e}")
             return ""
 
+    async def read_audit_signals(self, page: Page) -> dict:
+        """讀審計記錄，回傳兩個訊號：
+            last_saver:   最近一筆 Save/Accept/Update/Resolve 的人員姓名
+            wen_touched:  bool, wen.hsieh 是否在審計裡有過 Save/Accept/Update/Resolve
+
+        舊規則「Wen 最後 save」太嚴格 — 常被後續他人小動作蓋掉而漏標。
+        新規則「Wen 任何 save 痕跡」更寬鬆 — 只要 Wen 碰過此單，
+        就代表她驗證過此派單方向。
+        """
+        default = {"last_saver": "", "wen_touched": False}
+        try:
+            await page.click(
+                '#DynamicLayoutControl1_ctl116_T6T',
+                force=True, timeout=4000,
+            )
+            await page.wait_for_timeout(3500)
+
+            iframe_handle = await page.query_selector('iframe[id*="HistoryRecords"]')
+            if not iframe_handle:
+                return default
+            frame = await iframe_handle.content_frame()
+            if not frame:
+                return default
+
+            try:
+                await frame.wait_for_load_state("networkidle", timeout=8000)
+            except Exception:
+                pass
+            await page.wait_for_timeout(800)
+
+            result = await frame.evaluate("""
+                (function() {
+                    var rows = document.querySelectorAll('tr');
+                    var lastSaver = '';
+                    var wenTouched = false;
+                    for (var i = 0; i < rows.length; i++) {
+                        var tds = rows[i].querySelectorAll('td');
+                        if (tds.length < 3) continue;
+                        var action = (tds[2].innerText || '').trim();
+                        if (!/^(Save|Accept|Update|Resolve)$/i.test(action)) continue;
+                        var user = (tds[0].innerText || '').trim();
+                        if (!user || user === 'SYSTEM') continue;
+                        if (!lastSaver) lastSaver = user;
+                        if (/wen\\.hsieh|謝文譯/i.test(user)) {
+                            wenTouched = true;
+                        }
+                    }
+                    return {last_saver: lastSaver, wen_touched: wenTouched};
+                })();
+            """)
+            return result or default
+        except Exception as e:
+            log.debug(f"read_audit_signals 失敗: {e}")
+            return default
+
     @staticmethod
     def _is_real_correction(field: str, db_v: str, cur_v: str) -> bool:
         """判斷某欄位的「DB 值 → 現值」是否算「真修正」。
@@ -2130,12 +2185,15 @@ class ChangeGearBot:
 
                 cur = await self.read_current_assignment()
 
-                # 順便讀「最後 Save/Accept 者」用於 Wen 驗證機制
-                last_saver = await self.read_last_saver(self.page)
-                wen_blessed = 1 if self._is_wen(last_saver) else 0
-                if last_saver:
-                    log.debug(f"{ticket_id} 最後 Saver: {last_saver} (wen={wen_blessed})")
-                    # 不論 corrected 與否，每次都更新 last_saver
+                # 讀審計訊號（Wen 是否碰過 + 最後 saver）→ 更新 DB
+                signals = await self.read_audit_signals(self.page)
+                last_saver = signals["last_saver"]
+                wen_blessed = 1 if signals["wen_touched"] else 0
+                if last_saver or wen_blessed:
+                    log.debug(
+                        f"{ticket_id} last_saver={last_saver} "
+                        f"wen_touched={signals['wen_touched']}"
+                    )
                     try:
                         c2 = sqlite3.connect(DB_PATH)
                         c2.execute(
@@ -2145,7 +2203,7 @@ class ChangeGearBot:
                         c2.commit()
                         c2.close()
                     except Exception as e:
-                        log.debug(f"last_saver 寫入失敗: {e}")
+                        log.debug(f"審計訊號寫入失敗: {e}")
 
                 # 比較有無差異 — 用新版 helper 過濾掉「補資料 / 顯示變體」
                 diffs = {}
