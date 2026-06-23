@@ -962,7 +962,11 @@ Wen.Hsieh 是組織內的派單權威，她最後 Save/Accept 過的歷史單代
 2. assigned_to 不可留空。優先採用「CMDB 比對一致」的歷史候選對應人員；若無，採用 CMDB 反查擁有者；若 CMDB 也沒有，採用最相似的歷史候選人員。
 3. req_item 必須從上方「CMDB 資產清單」中挑選最符合工單描述的資產名稱。若工單描述模糊或無對應資產，留空字串。
 4. 系統會根據你選的 req_item 從 CMDB 反查擁有者並覆蓋你回傳的 owner/assigned_to，因此 req_item 選對非常重要。
-5. 只回傳 JSON，不要任何其他文字或 markdown。
+5. **【絕對遵守】整個回應必須以左大括號開頭、以右大括號結尾，純 JSON 物件。**
+   不要寫「分析這張工單」、「根據...分析」等開場白文字。
+   不要用 markdown code block（```）包起來。
+   分析推理請寫進 JSON 的 reasoning 欄位裡，不要寫在 JSON 之外。
+   違反此規則會導致解析失敗、工單漏派。
 
 ## 回傳格式
 {{
@@ -1010,7 +1014,9 @@ Wen.Hsieh 是組織內的派單權威，她最後 Save/Accept 過的歷史單代
         client = anthropic.AsyncAnthropic(api_key=api_key)
         response = await client.messages.create(
             model=RULES.get("claude_model", "claude-haiku-4-5"),
-            max_tokens=512,
+            # 512 太小：Sonnet 4.6 喜歡先寫分析再給 JSON，常被截斷導致 JSON 缺尾
+            # 2048 給足空間：1000 token 散文 + 500 token JSON + 500 緩衝
+            max_tokens=2048,
             system=[
                 {
                     "type": "text",
@@ -1033,11 +1039,39 @@ Wen.Hsieh 是組織內的派單權威，她最後 Save/Accept 過的歷史單代
 
         raw = response.content[0].text.strip()
 
-        # 移除可能的 markdown code block
+        # 移除 markdown code block
         raw = re.sub(r"^```(?:json)?\s*", "", raw)
         raw = re.sub(r"\s*```$", "", raw)
 
-        data = json.loads(raw)
+        # ── JSON 萃取（容錯）─────────────────────────────────────────
+        # Sonnet 4.6 容易先寫散文分析再給 JSON，造成 raw 不是純 JSON
+        # 從文字裡找最後一個 {...} 區塊解析（最後一個通常是真正的決策 JSON）
+        def _extract_json_block(text: str) -> str:
+            # 找所有最外層 {...} 區塊
+            depth = 0
+            start = -1
+            blocks = []
+            for idx, ch in enumerate(text):
+                if ch == "{":
+                    if depth == 0:
+                        start = idx
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0 and start >= 0:
+                        blocks.append(text[start:idx + 1])
+                        start = -1
+            # 回傳最後一個（最可能是 final answer）
+            return blocks[-1] if blocks else text
+
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            # 嚐試從散文中萃取 JSON 區塊
+            extracted = _extract_json_block(raw)
+            if extracted != raw:
+                log.info(f"[Claude] 從散文中萃取 JSON ({len(extracted)} chars)")
+            data = json.loads(extracted)   # 仍失敗會走外層 except
         confidence = float(data.get("confidence", 0))
         decision_src = str(data.get("decision_source", "unknown")).strip()
         log.info(
