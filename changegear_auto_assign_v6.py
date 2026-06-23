@@ -1968,29 +1968,63 @@ class ChangeGearBot:
     async def read_last_saver(self, page: Page) -> str:
         """從 ticket detail 頁讀取最後一個 Save / Accept 動作的執行者姓名。
 
-        ChangeGear 的審計記錄區塊（History/Activity Log）通常列在頁面下方，
-        每列 3 欄：使用者 / 時間 / 動作（Save / Accept / Submit / Create / Description）。
-        新→舊排序，第一筆就是最後動作。
+        ChangeGear 的審計記錄藏在「History tab」內，點開後內容載入 iframe：
+            <a id="DynamicLayoutControl1_ctl116_T6T">History</a>
+            <iframe id="DynamicLayoutControl1_ctl116_IncidentRequestHistoryRecords_iframe_*"
+                    class="GridPanelFrame"
+                    src="History.aspx?...parentEntityID=<oid>">
 
-        此函式以最寬鬆的方式嘗試多種 selector，找不到時回傳空字串。
+        iframe 內的 grid: `#GeneralGridControl1_ASPxGrid1`
+        每列欄位：Created By | Created | Action | Comment
+        新→舊排序，第一筆 row.cell[2]==Accept/Save → cell[0] 就是最後 saver。
+
+        流程：
+          1. 點 History tab 切換
+          2. 等 iframe 載入 (src 變成 History.aspx 即視為完成)
+          3. 進 iframe 找第一筆有 Save/Accept/Submit 的 row
+          4. 回傳該 row 第一欄文字
         """
         try:
-            return await page.evaluate("""
+            # Step 1: click History tab
+            await page.click(
+                '#DynamicLayoutControl1_ctl116_T6T',
+                force=True, timeout=4000,
+            )
+            await page.wait_for_timeout(3500)   # iframe lazy load
+
+            # Step 2: 找 HistoryRecords iframe
+            iframe_handle = await page.query_selector('iframe[id*="HistoryRecords"]')
+            if not iframe_handle:
+                log.debug("read_last_saver: 找不到 HistoryRecords iframe")
+                return ""
+            frame = await iframe_handle.content_frame()
+            if not frame:
+                log.debug("read_last_saver: iframe content_frame() 為 None")
+                return ""
+
+            # Step 3: 等 grid 載入
+            try:
+                await frame.wait_for_load_state("networkidle", timeout=8000)
+            except Exception:
+                pass
+            await page.wait_for_timeout(800)
+
+            # Step 4: 從 iframe 內 grid 抓第一筆 Save/Accept/Update 列
+            #         注意：iframe grid 內部 DOM 順序是「新→舊」（最新動作在前），
+            #         所以第一筆 match 就是「最後一個 Save/Accept/Update」。
+            #         動作中排除 Submit/Create/Description (那些是 requester 開單動作)
+            #         也排除 SYSTEM 角色 (自動排程的非人為動作)
+            return await frame.evaluate("""
                 (function() {
-                    // 1) 找包含 Save/Accept 字樣的 table row
-                    var rows = document.querySelectorAll(
-                        'table tr, .rgMasterTable tr, .RadGrid tr, ' +
-                        '[id*="History"] tr, [id*="Audit"] tr, ' +
-                        '[id*="Activity"] tr, [class*="History"] tr'
-                    );
+                    var rows = document.querySelectorAll('tr');
                     for (var i = 0; i < rows.length; i++) {
                         var tds = rows[i].querySelectorAll('td');
                         if (tds.length < 3) continue;
-                        var actionCell = (tds[tds.length-1].innerText || '').trim();
-                        // 第一筆 (新→舊排序) 且動作是 Save / Accept
-                        if (/^(Save|Accept|Update)$/i.test(actionCell)) {
-                            return (tds[0].innerText || '').trim();
-                        }
+                        var action = (tds[2].innerText || '').trim();
+                        if (!/^(Save|Accept|Update|Resolve)$/i.test(action)) continue;
+                        var user = (tds[0].innerText || '').trim();
+                        if (!user || user === 'SYSTEM') continue;
+                        return user;
                     }
                     return '';
                 })();
