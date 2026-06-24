@@ -2853,6 +2853,21 @@ class ChangeGearBot:
 
         a = await determine_assignment(summary, desc, requester, image_fetcher=_fetch_images)
 
+        # ── Long lead time services 特殊規則：Due Date 改為 +1 個月 ──
+        # 工單類型為 Long lead time services（無論 L2 或 L3）→ 不適用一般工作天
+        # 計算（4 / 5 天），改為自然日 30 天後到期，符合此類服務的長交期特性。
+        if a:
+            _ic2 = (a.get("inc_child") or "").lower()
+            _ic3 = (a.get("inc_item")  or "").lower()
+            if "long lead time" in _ic2 or "long lead time" in _ic3:
+                _long_due = datetime.now() + timedelta(days=30)
+                _new_due  = f"{_long_due.month}/{_long_due.day}/{_long_due.year}"
+                log.info(
+                    f"  ⏳ Long lead time services 規則：Due Date "
+                    f"{a.get('due_date','?')} → {_new_due}（+30 天）"
+                )
+                a["due_date"] = _new_due
+
         # ── 判定不通過（Claude 信心不足 / CMDB 審查未過）→ 僅追蹤，不派單 ──
         if a is None:
             log.info(
