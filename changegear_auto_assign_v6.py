@@ -959,7 +959,11 @@ Wen.Hsieh 是組織內的派單權威，她最後 Save/Accept 過的歷史單代
 
 ## 欄位規則
 1. inc_parent / inc_child / inc_item 必須完整照抄上方「有效的 Incident Type 清單」中的某一筆，不可自行創造或修改名稱。
-2. assigned_to 不可留空。優先採用「CMDB 比對一致」的歷史候選對應人員；若無，採用 CMDB 反查擁有者；若 CMDB 也沒有，採用最相似的歷史候選人員。
+2. **assigned_to 必須【一字不差】照抄歷史候選工單中曾出現過的 Assigned To 姓名**。
+   不可自行縮寫、修改拼字、調整大小寫、合併或拆解姓名。
+   範例：候選顯示 "luke.yu 余小勇" → assigned_to 寫 "luke.yu 余小勇"，不可寫 "luke.liu"、"Luke YU"、"luke" 之類。
+   優先順序：CMDB 比對一致的歷史候選 > CMDB 反查擁有者 > 最相似的歷史候選人員。
+   assigned_to 不可留空。
 3. req_item 必須從上方「CMDB 資產清單」中挑選最符合工單描述的資產名稱。若工單描述模糊或無對應資產，留空字串。
 4. 系統會根據你選的 req_item 從 CMDB 反查擁有者並覆蓋你回傳的 owner/assigned_to，因此 req_item 選對非常重要。
 5. **【絕對遵守】整個回應必須以左大括號開頭、以右大括號結尾，純 JSON 物件。**
@@ -1105,6 +1109,28 @@ Wen.Hsieh 是組織內的派單權威，她最後 Save/Accept 過的歷史單代
                     assigned_to = c["assigned_to"]
                     log.warning(f"Claude assigned_to 空白，補入候選值: {assigned_to}")
                     break
+
+        # ── 防止 Claude 幻覺：assigned_to 必須在候選清單中出現過 ──────────
+        # （例：Sonnet 4.6 曾把 "luke.yu" 改寫成 "luke.liu"）
+        # 若 assigned_to 不在任何候選的 assigned_to 內，自動降級為「最相似候選」的人員
+        if assigned_to and candidates:
+            candidate_names = [c.get("assigned_to", "") for c in candidates if c.get("assigned_to")]
+            # 完全比對 OR 子字串比對（容忍 "luke.yu" vs "luke.yu 余小勇"）
+            assigned_lower = assigned_to.lower()
+            matched = any(
+                assigned_lower == cn.lower()
+                or assigned_lower in cn.lower()
+                or cn.lower() in assigned_lower
+                for cn in candidate_names
+            )
+            if not matched and candidate_names:
+                # 取最高相似度候選的 assigned_to 替換
+                fallback = candidate_names[0]
+                log.warning(
+                    f"⚠ Claude assigned_to {assigned_to!r} 不在候選清單，"
+                    f"疑似幻覺；降級為最高相似度候選 {fallback!r}"
+                )
+                assigned_to = fallback
 
         # 防禦性：Claude 偶爾會在 inc_* 欄位塞入「A > B」之類的路徑串接
         # 若偵測到分隔符，取最後一段（最具體的那層）
@@ -1608,9 +1634,10 @@ async def set_incident_type(page: Page, level1: str, level2: str, level3: str):
 
         # ── L2：限縮在 L1 的 li 子樹內搜尋（避免抓到其他 L1 底下同名節點）──
         async def js_expand_l2(l1_text: str, l2_text: str) -> bool:
+            # 給 L1 子節點 AJAX 載完更多時間
+            await page.wait_for_timeout(800)
             result = await page.evaluate(f"""
                 (function() {{
-                    // 1. 找到 L1 的 li
                     var spans = document.querySelectorAll('span.rtIn');
                     var l1Li = null;
                     for (var i = 0; i < spans.length; i++) {{
@@ -1620,24 +1647,49 @@ async def set_incident_type(page: Page, level1: str, level2: str, level3: str):
                         }}
                     }}
                     if (!l1Li) return 'no l1';
-                    // 2. 只在 L1 的子節點內找 L2
-                    var childSpans = l1Li.querySelectorAll('ul span.rtIn');
+                    // 多種子容器：Telerik 可能用 ul / div.rtUL / 等
+                    var childSpans = l1Li.querySelectorAll('span.rtIn');
+                    // 移除 L1 自己這個 span（從整批 descendant 找）
                     for (var i = 0; i < childSpans.length; i++) {{
+                        if (childSpans[i].textContent.trim() === '{l1_text}') continue;
                         if (childSpans[i].textContent.trim() === '{l2_text}') {{
                             var li = childSpans[i].closest('li');
-                            if (!li) {{ childSpans[i].click(); return 'no-li'; }}
+                            if (!li) {{ childSpans[i].click(); return 'clicked-no-li'; }}
                             if (li.querySelector('.rtMinus')) return 'already-expanded';
                             var plus = li.querySelector('span.rtPlus, span.rtExpand');
                             if (plus) {{ plus.click(); return 'clicked-plus'; }}
                             childSpans[i].click(); return 'clicked-text';
                         }}
                     }}
-                    return 'not found';
+                    return 'not found in subtree';
                 }})();
             """)
             await page.wait_for_timeout(700)
-            if result in ("no l1", "not found"):
-                log.warning(f"L2 找不到節點: {l1_text} > {l2_text} (result={result})")
+            if result not in ("clicked-plus", "clicked-text", "clicked-no-li", "already-expanded"):
+                # Fallback：scoped 找不到 → 試「全頁第一個『可見』match」
+                log.debug(f"L2 scoped 找不到，嘗試全頁可見 fallback: {l1_text} > {l2_text}")
+                fb = await page.evaluate(f"""
+                    (function() {{
+                        var spans = document.querySelectorAll('span.rtIn');
+                        for (var i = 0; i < spans.length; i++) {{
+                            if (spans[i].textContent.trim() !== '{l2_text}') continue;
+                            // 只挑「可見」的（offsetParent !== null）
+                            if (spans[i].offsetParent === null) continue;
+                            var li = spans[i].closest('li');
+                            if (!li) {{ spans[i].click(); return 'fb-no-li'; }}
+                            if (li.querySelector('.rtMinus')) return 'fb-already-expanded';
+                            var plus = li.querySelector('span.rtPlus, span.rtExpand');
+                            if (plus) {{ plus.click(); return 'fb-clicked-plus'; }}
+                            spans[i].click(); return 'fb-clicked-text';
+                        }}
+                        return 'fb-not-found';
+                    }})();
+                """)
+                await page.wait_for_timeout(600)
+                if fb.startswith('fb-') and fb != 'fb-not-found':
+                    log.info(f"L2 fallback 命中：{l2_text} ({fb})")
+                    return True
+                log.warning(f"L2 找不到節點: {l1_text} > {l2_text} (scoped={result}, fb={fb})")
                 return False
             return True
 
