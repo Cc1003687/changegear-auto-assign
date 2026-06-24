@@ -895,8 +895,14 @@ def db_find_by_name(name: str,
 
 
 async def claude_assign(summary: str, description: str, requester: str,
-                        candidates: list[dict]) -> dict | None:
+                        candidates: list[dict],
+                        images: list[dict] | None = None) -> dict | None:
     """呼叫 Claude API，根據新工單與候選歷史記錄決定最佳派單。
+
+    Args:
+        images: 可選的圖片附件清單，[{"filename","media_type","base64","size"}, ...]
+                當第一輪信心 < 0.75，呼叫端可從工單附件下載圖片並再呼叫一次帶 images。
+                Claude Vision 會把圖片內容（例：error 截圖、設備照、流程圖）納入判斷。
 
     回傳格式與 determine_assignment 相同的 dict，失敗時回傳 None。
     """
@@ -1104,7 +1110,20 @@ Wen.Hsieh 是組織內的派單權威，她最後 Save/Accept 過的歷史單代
                     "cache_control": {"type": "ephemeral"},   # 5 分鐘 TTL
                 }
             ],
-            messages=[{"role": "user", "content": user_text}],
+            messages=[{
+                "role": "user",
+                "content": (
+                    # 帶圖：content 是 list of blocks (圖片在前，文字在後)
+                    [
+                        {"type": "image",
+                         "source": {"type": "base64",
+                                    "media_type": img["media_type"],
+                                    "data":       img["base64"]}}
+                        for img in (images or [])
+                    ]
+                    + [{"type": "text", "text": user_text}]
+                ) if images else user_text
+            }],
         )
 
         # ── 觀測快取命中率 ──────────────────────────────────────────
@@ -1238,7 +1257,8 @@ def match_keyword(text: str, rules: list) -> dict | None:
     return None
 
 async def determine_assignment(summary: str, description: str = "",
-                               requester: str = "") -> dict | None:
+                               requester: str = "",
+                               image_fetcher=None) -> dict | None:
     """派單決策引擎（AI / 傳統模式皆含 CMDB 鑑別審查層）。
 
     AI 模式（Claude API Key 已設定）：
@@ -1376,13 +1396,44 @@ async def determine_assignment(summary: str, description: str = "",
                 "_source":        ai_result["_source"],
             }
         else:
-            # Claude 信心不足（< 0.75）或呼叫失敗 → fallback 順序：
-            #   ① Wen 驗證工單（無門檻，無條件採用最相似的 wen-blessed 歷史單）
-            #   ② CMDB Direct（依 Requester's Item 反查 CMDB 擁有者）
-            #   ③ 追蹤不派單
+            # Claude 信心不足（< 0.75）或呼叫失敗 → 進入「圖片重試 + fallback」
+            # ── ⓪ 圖片二次判斷：先試抓附件圖片，帶 vision 重新呼叫 Claude ──
+            if image_fetcher:
+                try:
+                    images = await image_fetcher()
+                    if images:
+                        log.info(f"  Claude 信心不足 → 抓到 {len(images)} 張圖片，帶 vision 重試")
+                        ai_result2 = await claude_assign(
+                            summary, description, requester, candidates, images=images
+                        )
+                        if ai_result2:
+                            ai_conf2 = ai_result2.get("confidence", 0.85)
+                            log.info(
+                                f"  ⚡ Claude Vision 二次判斷成功: assigned={ai_result2['assigned_to']} "
+                                f"信心={ai_conf2:.2f}"
+                            )
+                            return {
+                                "owner":          ai_result2["owner"],
+                                "assigned_to":    ai_result2["assigned_to"],
+                                "inc_parent":     ai_result2["inc_parent"],
+                                "inc_child":      ai_result2["inc_child"],
+                                "inc_item":       ai_result2["inc_item"],
+                                "requester_item": (ai_result2.get("requester_item") or "").strip(),
+                                "impact":         _impact,
+                                "urgency":        _urgency,
+                                "priority":       _priority,
+                                "due_date":       _due_date,
+                                "_score":         ai_conf2,
+                                "_source":        f"{ai_result2['_source']}+Vision",
+                            }
+                except Exception as _e:
+                    log.debug(f"Vision 重試失敗: {_e}")
+
+            # ── ① Wen 驗證候選 ──
             if _wen_match:
                 log.info(f"Claude 信心不足，改用 Wen 驗證候選派單 | {_wen_match['_source']}")
                 return _build_wen_dispatch()
+            # ── ② CMDB Direct ──
             if _cmdb_direct:
                 log.info(f"Claude 信心不足，改用 CMDB Direct 派單 | {_cmdb_direct['_source']}")
                 return _build_cmdb_direct_dispatch()
@@ -2306,6 +2357,104 @@ class ChangeGearBot:
         n = name.lower()
         return any(w.lower() in n for w in cls.WEN_AUTHORITY_NAMES)
 
+    async def read_image_attachments(self, page: Page) -> list[dict]:
+        """從 ChangeGear 工單的 Attachments tab 讀取圖片附件，下載到記憶體
+        以 base64 編碼回傳，供 Claude Vision 使用。
+
+        流程：
+          1. 點 Attachments tab（#DynamicLayoutControl1_ctl116_T4T）
+          2. 等 IncidentRequestAttachmentRecords iframe 載入
+          3. 從 iframe 內 grid 抓檔名與下載 URL
+          4. 透過 page.context.request 直接拉檔（用 Playwright 內建 fetch，
+             共享 session cookie 不必另外登入）
+          5. 過濾常見圖片副檔名（jpg/jpeg/png/gif/webp）
+          6. base64 encode 回傳
+
+        回傳 [{'filename': str, 'media_type': str, 'base64': str}, ...]
+        失敗 / 沒附件 / 都不是圖 → 空 list
+        """
+        import base64
+        IMG_EXT = {"jpg", "jpeg", "png", "gif", "webp", "bmp"}
+        out = []
+        try:
+            # 點 Attachments tab (T4 = 第 5 個 tab, 0-indexed: Description=T0, Tasks=T1, ...)
+            await page.click(
+                '#DynamicLayoutControl1_ctl116_T4T',
+                force=True, timeout=4000,
+            )
+            await page.wait_for_timeout(3000)
+
+            iframe_handle = await page.query_selector('iframe[id*="AttachmentRecords"]')
+            if not iframe_handle:
+                log.debug("read_image_attachments: 找不到 AttachmentRecords iframe")
+                return []
+            frame = await iframe_handle.content_frame()
+            if not frame:
+                return []
+
+            try:
+                await frame.wait_for_load_state("networkidle", timeout=6000)
+            except Exception:
+                pass
+            await page.wait_for_timeout(800)
+
+            # 抓清單：每列含 filename 與下載 link
+            rows = await frame.evaluate("""
+                (function() {
+                    var trs = document.querySelectorAll('tr');
+                    var out = [];
+                    for (var i = 0; i < trs.length; i++) {
+                        var tds = trs[i].querySelectorAll('td');
+                        if (tds.length < 2) continue;
+                        // 找該列內的下載 <a> link
+                        var link = trs[i].querySelector('a[href]');
+                        if (!link) continue;
+                        var href = link.href || '';
+                        var name = (link.innerText || link.textContent || '').trim();
+                        if (!name || /file name/i.test(name)) continue;
+                        out.push({filename: name, url: href});
+                    }
+                    return out;
+                })();
+            """)
+            if not rows:
+                log.debug("read_image_attachments: 附件 grid 內無檔案")
+                return []
+
+            log.info(f"  附件清單: {len(rows)} 個檔案")
+            ctx_request = page.context.request
+
+            for r in rows[:6]:   # 最多取 6 個避免 token 爆炸
+                fname = r["filename"]
+                ext = fname.rsplit(".", 1)[-1].lower() if "." in fname else ""
+                if ext not in IMG_EXT:
+                    continue
+                try:
+                    resp = await ctx_request.get(r["url"], timeout=15000)
+                    if not resp.ok:
+                        log.debug(f"  下載 {fname} 失敗: HTTP {resp.status}")
+                        continue
+                    body = await resp.body()
+                    media_type = {
+                        "jpg": "image/jpeg", "jpeg": "image/jpeg",
+                        "png": "image/png", "gif": "image/gif",
+                        "webp": "image/webp", "bmp": "image/bmp",
+                    }.get(ext, "image/png")
+                    out.append({
+                        "filename":   fname,
+                        "media_type": media_type,
+                        "base64":     base64.b64encode(body).decode("ascii"),
+                        "size":       len(body),
+                    })
+                    log.info(f"  ✓ 下載圖片附件: {fname} ({len(body)} bytes)")
+                except Exception as e:
+                    log.debug(f"  下載 {fname} 例外: {e}")
+                    continue
+        except Exception as e:
+            log.debug(f"read_image_attachments 失敗: {e}")
+        return out
+
+
     async def read_last_saver(self, page: Page) -> str:
         """從 ticket detail 頁讀取最後一個 Save / Accept 動作的執行者姓名。
 
@@ -2697,7 +2846,12 @@ class ChangeGearBot:
         # 詳細頁的 requester 優先（更完整），清單頁的備用
         requester = req_detail or requester
 
-        a = await determine_assignment(summary, desc, requester)
+        # 圖片附件 lazy fetcher：只有當 Claude 信心 < 0.75 時才會被呼叫
+        # （正常情況下節省一次 Attachments tab 切換 + iframe 載入 ~3 秒）
+        async def _fetch_images():
+            return await self.read_image_attachments(self.page)
+
+        a = await determine_assignment(summary, desc, requester, image_fetcher=_fetch_images)
 
         # ── 判定不通過（Claude 信心不足 / CMDB 審查未過）→ 僅追蹤，不派單 ──
         if a is None:
