@@ -1174,25 +1174,23 @@ Wen.Hsieh 是組織內的派單權威，她最後 Save/Accept 過的歷史單代
                     log.warning(f"Claude assigned_to 空白，補入候選值: {assigned_to}")
                     break
 
-        # ── 防止 Claude 幻覺：assigned_to 必須在候選清單中出現過 ──────────
-        # （例：Sonnet 4.6 曾把 "luke.yu" 改寫成 "luke.liu"）
-        # 若 assigned_to 不在任何候選的 assigned_to 內，自動降級為「最相似候選」的人員
+        # ── 防止 Claude 幻覺：用 AD 帳號精確比對 ─────────────────────────
+        # 之前 substring 比對抓不到「luke.yu → luke.liu」（兩個都是真實員工，
+        # 姓氏字根不同）。改用 _extract_ad_account 萃取 AD 帳號後做集合精確比對。
         if assigned_to and candidates:
-            candidate_names = [c.get("assigned_to", "") for c in candidates if c.get("assigned_to")]
-            # 完全比對 OR 子字串比對（容忍 "luke.yu" vs "luke.yu 余小勇"）
-            assigned_lower = assigned_to.lower()
-            matched = any(
-                assigned_lower == cn.lower()
-                or assigned_lower in cn.lower()
-                or cn.lower() in assigned_lower
-                for cn in candidate_names
-            )
-            if not matched and candidate_names:
-                # 取最高相似度候選的 assigned_to 替換
-                fallback = candidate_names[0]
+            candidate_ad = {
+                _extract_ad_account(c.get("assigned_to", "")).lower()
+                for c in candidates if c.get("assigned_to")
+            }
+            candidate_ad.discard("")
+            claude_ad = _extract_ad_account(assigned_to).lower()
+            # AD 帳號完全不在候選清單 → 視為幻覺
+            if candidate_ad and claude_ad and claude_ad not in candidate_ad:
+                fallback = candidates[0]["assigned_to"]
                 log.warning(
-                    f"⚠ Claude assigned_to {assigned_to!r} 不在候選清單，"
-                    f"疑似幻覺；降級為最高相似度候選 {fallback!r}"
+                    f"⚠ Claude assigned_to {assigned_to!r} 的 AD={claude_ad!r} "
+                    f"不在候選 AD 清單 {sorted(candidate_ad)}，疑似幻覺；"
+                    f"降級為最高相似度候選 {fallback!r}"
                 )
                 assigned_to = fallback
 
@@ -1686,7 +1684,7 @@ async def set_incident_type(page: Page, level1: str, level2: str, level3: str):
         """)
         await page.wait_for_timeout(1000)
 
-        # ── L1：在全頁範圍找，展開 + 等子節點 AJAX 載入 ─────────────
+        # ── L1：展開 + 動態等子節點真的出現（不再用固定 sleep）─────────
         async def js_expand_l1(text: str) -> bool:
             result = await page.evaluate(f"""
                 (function() {{
@@ -1695,7 +1693,6 @@ async def set_incident_type(page: Page, level1: str, level2: str, level3: str):
                         if (spans[i].textContent.trim() === '{text}') {{
                             var li = spans[i].closest('li');
                             if (!li) {{ spans[i].click(); return 'no-li'; }}
-                            // 若已展開（rtMinus 圖示存在）→ 不再點，避免折疊
                             if (li.querySelector('.rtMinus')) return 'already-expanded';
                             var plus = li.querySelector('span.rtPlus, span.rtExpand');
                             if (plus) {{ plus.click(); return 'clicked-plus'; }}
@@ -1705,16 +1702,31 @@ async def set_incident_type(page: Page, level1: str, level2: str, level3: str):
                     return 'not found';
                 }})();
             """)
-            await page.wait_for_timeout(800)   # 等 AJAX 載入子節點
             if result == "not found":
                 log.warning(f"L1 找不到節點: {text}")
                 return False
+            # 動態等子節點 li 出現（Telerik AJAX 載入時間不固定，最多等 4 秒）
+            try:
+                await page.wait_for_function(f"""
+                    (function() {{
+                        var spans = document.querySelectorAll('span.rtIn');
+                        for (var i = 0; i < spans.length; i++) {{
+                            if (spans[i].textContent.trim() === '{text}') {{
+                                var li = spans[i].closest('li');
+                                if (!li) return false;
+                                return li.querySelectorAll('li').length > 0;
+                            }}
+                        }}
+                        return false;
+                    }})()
+                """, timeout=4000)
+            except Exception:
+                log.debug(f"L1 子節點等候 timeout: {text}（將繼續嘗試 L2 搜尋）")
+            await page.wait_for_timeout(300)
             return True
 
         # ── L2：限縮在 L1 的 li 子樹內搜尋（避免抓到其他 L1 底下同名節點）──
         async def js_expand_l2(l1_text: str, l2_text: str) -> bool:
-            # 給 L1 子節點 AJAX 載完更多時間
-            await page.wait_for_timeout(800)
             result = await page.evaluate(f"""
                 (function() {{
                     var spans = document.querySelectorAll('span.rtIn');
@@ -1768,6 +1780,51 @@ async def set_incident_type(page: Page, level1: str, level2: str, level3: str):
                 if fb.startswith('fb-') and fb != 'fb-not-found':
                     log.info(f"L2 fallback 命中：{l2_text} ({fb})")
                     return True
+                # ── 最後一招：強制再點一次 L1 展開、等子節點，然後重試 scoped 搜尋
+                log.debug(f"L2 連 fallback 都失敗，重點 L1 重試一次: {l1_text}")
+                await page.evaluate(f"""
+                    (function() {{
+                        var spans = document.querySelectorAll('span.rtIn');
+                        for (var i = 0; i < spans.length; i++) {{
+                            if (spans[i].textContent.trim() === '{l1_text}') {{
+                                spans[i].click();
+                                return;
+                            }}
+                        }}
+                    }})();
+                """)
+                try:
+                    await page.wait_for_function(f"""
+                        (function() {{
+                            var spans = document.querySelectorAll('span.rtIn');
+                            for (var i = 0; i < spans.length; i++) {{
+                                if (spans[i].textContent.trim() === '{l2_text}'
+                                    && spans[i].offsetParent !== null) {{
+                                    return true;
+                                }}
+                            }}
+                            return false;
+                        }})()
+                    """, timeout=4000)
+                    retry = await page.evaluate(f"""
+                        (function() {{
+                            var spans = document.querySelectorAll('span.rtIn');
+                            for (var i = 0; i < spans.length; i++) {{
+                                if (spans[i].textContent.trim() === '{l2_text}'
+                                    && spans[i].offsetParent !== null) {{
+                                    spans[i].click();
+                                    return 'retry-clicked';
+                                }}
+                            }}
+                            return 'retry-not-found';
+                        }})();
+                    """)
+                    await page.wait_for_timeout(500)
+                    if retry == "retry-clicked":
+                        log.info(f"L2 重試命中：{l2_text}")
+                        return True
+                except Exception:
+                    pass
                 log.warning(f"L2 找不到節點: {l1_text} > {l2_text} (scoped={result}, fb={fb})")
                 return False
             return True
