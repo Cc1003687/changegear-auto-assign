@@ -267,6 +267,70 @@ def db_save(ticket_id: str, oid: str, summary: str, description: str,
     except Exception as e:
         log.warning(f"DB 儲存失敗: {e}")
 
+def db_find_wen_blessed(summary: str, description: str = "",
+                        requester: str = "") -> dict | None:
+    """從 wen.hsieh 驗證過的歷史工單中找最相似的一筆（無門檻）。
+
+    用途：Claude 信心不足（< 0.75）時的優先 fallback 來源。
+    比對策略與 db_find_similar 一致，但只在 is_wen_blessed = 1 的資料內找，
+    且**不設相似度門檻**，永遠回傳最佳一筆（除非 DB 內沒有任何 wen 驗證單）。
+
+    回傳 dict 含 owner / assigned_to / inc_type / req_item / _score / _source。
+    _score 固定 0.85（觸發跳過 Help Desk 過濾）。
+    """
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        rows = conn.execute("""
+            SELECT ticket_id, summary, description, requester,
+                   owner, assigned_to, inc_parent, inc_child, inc_item, req_item
+            FROM   assignments
+            WHERE  is_wen_blessed = 1
+            ORDER  BY created_at DESC
+            LIMIT  500
+        """).fetchall()
+        conn.close()
+    except Exception as e:
+        log.warning(f"db_find_wen_blessed DB 查詢失敗: {e}")
+        return None
+
+    if not rows:
+        return None
+
+    query_text = f"{summary} {description}".lower().strip()
+    req_lower  = requester.lower().strip()
+    best_score = -1.0
+    best_row   = None
+
+    for row in rows:
+        hist_text  = f"{row[1]} {row[2] or ''}".lower().strip()
+        text_ratio = SequenceMatcher(None, query_text, hist_text).ratio() if hist_text else 0.0
+        req_bonus  = 0.0
+        if req_lower and row[3]:
+            hist_req = row[3].lower().strip()
+            if req_lower == hist_req:
+                req_bonus = 0.30
+            elif req_lower in hist_req or hist_req in req_lower:
+                req_bonus = 0.15
+        score = text_ratio + req_bonus
+        if score > best_score:
+            best_score = score
+            best_row   = row
+
+    if not best_row:
+        return None
+
+    return {
+        "owner":          best_row[4],
+        "assigned_to":    best_row[5],
+        "inc_parent":     best_row[6],
+        "inc_child":      best_row[7],
+        "inc_item":       best_row[8],
+        "requester_item": best_row[9] or "",
+        "_score":         0.85,    # 強制視為高信任，跳過 Help Desk 過濾
+        "_source":        f"Wen驗證({best_row[0]},sim={best_score:.2f})",
+    }
+
+
 def db_find_similar(summary: str, description: str = "", requester: str = "") -> dict | None:
     """從歷史 DB 找最相似的派單記錄。
 
@@ -1181,18 +1245,14 @@ async def determine_assignment(summary: str, description: str = "",
 
     AI 模式（Claude API Key 已設定）：
       ① Claude AI（信心 >= 0.75）→ 派單（Claude prompt 內已含 CMDB 註記 + Wen 驗證等三信號）
-           - Sonnet 4.6 自評偏保守，0.75–0.85 區間實測答案多半正確
-           - Claude 已綜合 內容 + 歷史候選 + CMDB 擁有者 做出單一決策，不再事後覆蓋
-      ② Claude 信心不足（< 0.75）或呼叫失敗
-           - 若 CMDB Direct 候選存在 → 用 CMDB Direct 派單
-           - 否則 → 追蹤不派單
+      ② Claude 信心不足（< 0.75）或呼叫失敗 → fallback 順序：
+           a. Wen 驗證候選（無門檻，採用最相似的 wen-blessed 歷史單）
+           b. CMDB Direct（依 Requester's Item 反查 CMDB 擁有者）
+           c. 追蹤不派單
 
     傳統模式（無 Claude API Key）：
-      ① SQLite 歷史比對（分數 >= db_similarity）
-           分數 >= 0.75 → 進入 CMDB 鑑別審查（同上流程）
-           分數 0.65-0.74 → 直接派單（略過 CMDB 審查）
-      ② Excel 關鍵字規則
-      ③ 預設值
+      ① SQLite 歷史比對 / CMDB Direct（取分數高者）
+      ② 預設值（Excel 關鍵字規則已停用，設定保留供日後切換）
 
     Returns:
         dict  → 有派單決策，可繼續派單
@@ -1223,7 +1283,6 @@ async def determine_assignment(summary: str, description: str = "",
     # 此候選會在 AI/DB 兩條路徑作為 fallback 使用。
     _excel_ri_match = match_keyword(combined, RULES["requester_items"])
     _ri_candidate   = _excel_ri_match["item"] if _excel_ri_match else ""
-    _excel_kw_match = match_keyword(combined, RULES["keyword_rules"])  # 預先取 Excel inc_type
     _cmdb_direct    = cmdb_direct_lookup(_ri_candidate)
     if _cmdb_direct:
         log.info(
@@ -1232,17 +1291,39 @@ async def determine_assignment(summary: str, description: str = "",
             f"(CI={_cmdb_direct['requester_item']}, score={_cmdb_direct['_score']:.2f})"
         )
 
+    # ── Wen 驗證候選（無門檻）：Claude 信心不足時的優先 fallback ────────────
+    _wen_match = db_find_wen_blessed(summary, description, requester)
+    if _wen_match:
+        log.info(
+            f"Wen 驗證候選: Owner={_wen_match['owner']} / "
+            f"Assigned={_wen_match['assigned_to']} | {_wen_match['_source']}"
+        )
+
     def _fill_inc_type(base: dict) -> dict:
-        """CMDB Direct 缺 Incident Type → 從 Excel 關鍵字補；都沒有則用安全預設值。"""
-        if _excel_kw_match:
-            base["inc_parent"] = _excel_kw_match["inc_parent"]
-            base["inc_child"]  = _excel_kw_match["inc_child"]
-            base["inc_item"]   = _excel_kw_match["inc_item"]
-        else:
-            base["inc_parent"] = "Service Request"
-            base["inc_child"]  = "Infrastructure"
-            base["inc_item"]   = "Standard Request"
+        """CMDB Direct 缺 Incident Type → 用安全預設值。
+        Excel keyword_rules 不再參與派單決策（用戶要求保留設定但停用功能）。
+        """
+        base["inc_parent"] = "Service Request"
+        base["inc_child"]  = "Infrastructure"
+        base["inc_item"]   = "Standard Request"
         return base
+
+    def _build_wen_dispatch() -> dict:
+        """組裝 Wen 驗證 fallback 派單結果。"""
+        return {
+            "owner":          _wen_match["owner"],
+            "assigned_to":    _wen_match["assigned_to"],
+            "inc_parent":     _wen_match["inc_parent"] or "Service Request",
+            "inc_child":      _wen_match["inc_child"]  or "Infrastructure",
+            "inc_item":       _wen_match["inc_item"]   or "Standard Request",
+            "requester_item": _wen_match["requester_item"],
+            "impact":         _impact,
+            "urgency":        _urgency,
+            "priority":       _priority,
+            "due_date":       _due_date,
+            "_score":         _wen_match["_score"],
+            "_source":        _wen_match["_source"],
+        }
 
     def _build_cmdb_direct_dispatch() -> dict:
         """組裝 CMDB Direct 派單結果（含 inc_type 補齊、impact/priority/due_date）。"""
@@ -1297,11 +1378,17 @@ async def determine_assignment(summary: str, description: str = "",
                 "_source":        ai_result["_source"],
             }
         else:
-            # Claude 信心不足（< 0.75）或呼叫失敗 → 嘗試 CMDB Direct fallback，否則追蹤不派單
+            # Claude 信心不足（< 0.75）或呼叫失敗 → fallback 順序：
+            #   ① Wen 驗證工單（無門檻，無條件採用最相似的 wen-blessed 歷史單）
+            #   ② CMDB Direct（依 Requester's Item 反查 CMDB 擁有者）
+            #   ③ 追蹤不派單
+            if _wen_match:
+                log.info(f"Claude 信心不足，改用 Wen 驗證候選派單 | {_wen_match['_source']}")
+                return _build_wen_dispatch()
             if _cmdb_direct:
                 log.info(f"Claude 信心不足，改用 CMDB Direct 派單 | {_cmdb_direct['_source']}")
                 return _build_cmdb_direct_dispatch()
-            log.warning(f"Claude 信心不足 (< 0.75) 且無 CMDB Direct 候選，工單僅追蹤不派單 | {summary[:50]}")
+            log.warning(f"Claude 信心不足 (< 0.75) 且無 Wen / CMDB 候選，工單僅追蹤不派單 | {summary[:50]}")
             return None
 
     # ══ 傳統模式：無 Claude API Key ═══════════════════════════════════
@@ -1372,22 +1459,14 @@ async def determine_assignment(summary: str, description: str = "",
         inc_item              = hist["inc_item"]
         source                = hist["_source"]
     else:
-        # ② Excel 關鍵字規則
-        matched = match_keyword(combined, RULES["keyword_rules"])
-        if matched:
-            owner, assigned = matched["owner"], matched["assigned_to"]
-            inc_parent, inc_child, inc_item = (
-                matched["inc_parent"], matched["inc_child"], matched["inc_item"])
-            source = "Excel關鍵字"
-        else:
-            # ③ 預設值
-            log.warning(f"無匹配，使用預設 | {summary[:50]}")
-            owner      = RULES["default_owner"]
-            assigned   = RULES["default_assigned"]
-            inc_parent = "Service Request"
-            inc_child  = "Infrastructure" if owner.lower() in ["infra","help desk","helpdesk"] else "Application"
-            inc_item   = "Standard Request"
-            source     = "預設值"
+        # ② 預設值（Excel 關鍵字規則已停用，僅保留 Excel 設定）
+        log.warning(f"無匹配，使用預設 | {summary[:50]}")
+        owner      = RULES["default_owner"]
+        assigned   = RULES["default_assigned"]
+        inc_parent = "Service Request"
+        inc_child  = "Infrastructure" if owner.lower() in ["infra","help desk","helpdesk"] else "Application"
+        inc_item   = "Standard Request"
+        source     = "預設值"
 
     # Requester's Item：DB 歷史優先 → Excel → 空
     requester_item = (hist.get("requester_item") or "") if hist else ""
