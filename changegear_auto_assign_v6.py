@@ -56,13 +56,13 @@ PRIORITY_MAP = {"1 - Critical":"1","2 - High":"2","3 - Medium":"3","4 - Low":"4"
 # 格式：(L1, L2, L3, Responsible)；L2/L3 為空字串代表該層不存在
 VALID_INCIDENT_TYPES = [
     ("Complaint",       "",                       "",                         "All"),
-    ("Error or Failure","Applications",           "",                         "Application"),
+    ("Error or Failure","Application",            "",                         "Application"),
     ("Error or Failure","Infrastructure",         "",                         "Infrastructure"),
     ("Inquiry",         "",                       "",                         "All"),
-    ("IT2IT Request",   "Applications",           "",                         "Application"),
+    ("IT2IT Request",   "Application",            "",                         "Application"),
     ("IT2IT Request",   "Infrastructure",         "",                         "infra/Helpdesk"),
-    ("Service Request", "Applications",           "Standard Request",         "Application"),
-    ("Service Request", "Applications",           "New Demand",               "Application"),
+    ("Service Request", "Application",            "Standard Request",         "Application"),
+    ("Service Request", "Application",            "New Demand",               "Application"),
     ("Service Request", "Infrastructure",         "Standard Request",         "Helpdesk/Infra"),
     ("Service Request", "Infrastructure",         "Standard Request - nonSLA","Helpdesk/Infra"),
     ("Service Request", "Infrastructure",         "New Demand",               "Helpdesk/Infra"),
@@ -1099,13 +1099,17 @@ Wen.Hsieh 是組織內的派單權威，她最後 Save/Accept 過的歷史單代
 ## 【重要範例 — inc_parent / inc_child / inc_item 格式】
 正確：
   "inc_parent": "IT2IT Request",
-  "inc_child":  "Applications",
+  "inc_child":  "Application",
   "inc_item":   ""
 
-錯誤（不要串接路徑）：
-  "inc_child":  "IT2IT Request > Applications"   ❌
-  "inc_child":  "IT2IT Request: Applications"    ❌
-  "inc_item":   "IT2IT Request > Applications"   ❌
+⚠ ChangeGear UI 的 L2 名稱是「Application」（單數），不是「Applications」。
+   即使 CSV 或舊資料寫「Applications」，請一律填「Application」。
+
+錯誤（不要串接路徑、不要用複數）：
+  "inc_child":  "Applications"                   ❌ 用單數
+  "inc_child":  "IT2IT Request > Application"    ❌ 不串接
+  "inc_child":  "IT2IT Request: Application"     ❌
+  "inc_item":   "IT2IT Request > Application"    ❌
 每個欄位都只填單一層的名稱，不含分隔符或上層名稱。"""
 
     # ── 抓取人工教學紀錄（feedback）中最相關的條目 ──────────────────
@@ -1870,7 +1874,7 @@ async def set_incident_type(page: Page, level1: str, level2: str, level3: str):
                 return 'no-tree-control';
             }})();
         """)
-        log.debug(f"  Telerik API: {api_result}")
+        log.info(f"  Telerik API 嘗試: {api_result}")
         if api_result in ("ok-l2", "ok-l3"):
             log.info(f"✓ Incident Type (Telerik API): {level1} > {level2} > {level3 or '(無L3)'}")
             await page.keyboard.press("Escape")
@@ -1878,7 +1882,7 @@ async def set_incident_type(page: Page, level1: str, level2: str, level3: str):
             return
 
         # API 沒成功 → 降到舊版 DOM 點擊邏輯
-        log.debug(f"  Telerik API 失敗 ({api_result})，改用 DOM 點擊邏輯")
+        log.info(f"  Telerik API 未成功，改用 DOM 點擊邏輯")
 
         # ── L1：展開 + 動態等子節點真的出現（不再用固定 sleep）─────────
         async def js_expand_l1(text: str) -> bool:
