@@ -267,6 +267,34 @@ def db_save(ticket_id: str, oid: str, summary: str, description: str,
     except Exception as e:
         log.warning(f"DB 儲存失敗: {e}")
 
+def db_get_team_members(owner: str) -> set[str]:
+    """從歷史派單記錄取得某 owner 團隊曾派過的人員 AD 帳號集合。
+
+    用於驗證 Claude 回傳的 (owner, assigned_to) 是否為合法團隊組合。
+    例：owner="Help Desk" 對應 {"wen.hsieh", "kyle.wu", "it leo", ...}
+        owner="HQIT ADS"  對應 {"simon.lu", "ariel.zhang", "ann.lee", ...}
+    """
+    if not owner:
+        return set()
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        rows = conn.execute("""
+            SELECT DISTINCT assigned_to
+            FROM   assignments
+            WHERE  owner = ? AND assigned_to != ''
+            LIMIT  200
+        """, (owner,)).fetchall()
+        conn.close()
+    except Exception:
+        return set()
+    members = set()
+    for r in rows:
+        ad = _extract_ad_account(r[0]).lower()
+        if ad:
+            members.add(ad)
+    return members
+
+
 def db_find_wen_blessed(summary: str, description: str = "",
                         requester: str = "") -> dict | None:
     """從 wen.hsieh 驗證過的歷史工單中找最相似的一筆（無門檻）。
@@ -1032,8 +1060,21 @@ Wen.Hsieh 是組織內的派單權威，她最後 Save/Accept 過的歷史單代
 2. **assigned_to 必須【一字不差】照抄歷史候選工單中曾出現過的 Assigned To 姓名**。
    不可自行縮寫、修改拼字、調整大小寫、合併或拆解姓名。
    範例：候選顯示 "luke.yu 余小勇" → assigned_to 寫 "luke.yu 余小勇"，不可寫 "luke.liu"、"Luke YU"、"luke" 之類。
-   優先順序：CMDB 比對一致的歷史候選 > CMDB 反查擁有者 > 最相似的歷史候選人員。
+
+   **判斷 assigned_to 的優先順序（從高到低）**：
+   (a) **Description 內文若有「Hi xxx」「Dear xxx」「請 xxx 協助」等明確指名 → xxx 就是指派人員**（最強信號）
+   (b) Wen.Hsieh 驗證過的歷史候選（標 🌟 者）的對應人員
+   (c) CMDB 比對一致的歷史候選對應人員
+   (d) CMDB 反查擁有者
+   (e) 最相似的歷史候選人員
+
    assigned_to 不可留空。
+
+   **owner 與 assigned_to 必須來自同一團隊**。例如：
+   - owner="Help Desk" → assigned 應為 Help Desk 團隊成員（如 wen.hsieh / kyle.wu / IT Leo）
+   - owner="HQIT ADS" → assigned 應為 ADS 團隊成員（如 simon.lu / ariel.zhang）
+   - owner="CHINA IT" → assigned 應為中國 IT 團隊（如 luke.yu / evan.yang）
+   不可出現「owner=Help Desk + assigned=simon.lu」這種跨團隊配對。
 3. req_item 必須從上方「CMDB 資產清單」中挑選最符合工單描述的資產名稱。若工單描述模糊或無對應資產，留空字串。
 4. 系統會根據你選的 req_item 從 CMDB 反查擁有者並覆蓋你回傳的 owner/assigned_to，因此 req_item 選對非常重要。
 5. **【絕對遵守】整個回應必須以左大括號開頭、以右大括號結尾，純 JSON 物件。**
@@ -1212,6 +1253,48 @@ Wen.Hsieh 是組織內的派單權威，她最後 Save/Accept 過的歷史單代
                     f"降級為最高相似度候選 {fallback!r}"
                 )
                 assigned_to = fallback
+
+        # ── 防呆 2：Owner / Assigned 團隊綁定驗證 ─────────────────────
+        # 例：owner="Help Desk" + assigned="simon.lu"（屬 HQIT ADS）→ 不合法
+        # 從歷史 DB 抓該 owner 真正派過的人員集合，不符 → 用同 owner 的候選替換
+        claude_owner = str(data.get("owner", "")).strip()
+        if claude_owner and assigned_to and candidates:
+            team_members = db_get_team_members(claude_owner)
+            claude_ad2 = _extract_ad_account(assigned_to).lower()
+            if team_members and claude_ad2 and claude_ad2 not in team_members:
+                # 在候選清單裡找 owner 相同的人員替換
+                same_owner_candidate = next(
+                    (c for c in candidates
+                     if c.get("owner", "").strip().lower() == claude_owner.lower()
+                     and c.get("assigned_to")),
+                    None,
+                )
+                if same_owner_candidate:
+                    new_assigned = same_owner_candidate["assigned_to"]
+                    log.warning(
+                        f"⚠ Owner-Assigned 不配對：Owner={claude_owner!r} "
+                        f"但 Assigned={assigned_to!r} 不在該團隊 {sorted(team_members)[:8]}；"
+                        f"改用候選同 owner 人員 {new_assigned!r}"
+                    )
+                    assigned_to = new_assigned
+
+        # ── 防呆 3：Description 中含「Hi xxx」明確指名 → 優先採用 ──
+        hi_name = extract_hi_name(description)
+        if hi_name and candidates:
+            hi_ad = _extract_ad_account(hi_name).lower()
+            cur_ad = _extract_ad_account(assigned_to).lower()
+            # 候選中是否有 AD 完全等於 hi_name 的人員？
+            hi_candidate = next(
+                (c for c in candidates
+                 if c.get("assigned_to") and _extract_ad_account(c["assigned_to"]).lower() == hi_ad),
+                None,
+            )
+            if hi_candidate and cur_ad != hi_ad:
+                log.warning(
+                    f"⚠ Description 內文明確指名 {hi_name!r}（AD={hi_ad}），"
+                    f"但 Claude 派給 {assigned_to!r}；改派給 {hi_candidate['assigned_to']!r}"
+                )
+                assigned_to = hi_candidate["assigned_to"]
 
         # 防禦性：Claude 偶爾會在 inc_* 欄位塞入「A > B」之類的路徑串接
         # 若偵測到分隔符，取最後一段（最具體的那層）
@@ -1776,8 +1859,45 @@ async def set_incident_type(page: Page, level1: str, level2: str, level3: str):
             await page.wait_for_timeout(300)
             return True
 
-        # ── L2：限縮在 L1 的 li 子樹內搜尋（避免抓到其他 L1 底下同名節點）──
+        # ── L2：自底向上找 — 從 L2 text 找對應的 li，再驗證它的父 li 文字 = L1 ──
+        # 比舊版 scoped 子樹搜尋更可靠：避免 L1 subtree 還沒展開但兄弟 L1
+        # 已有同名節點的干擾。
         async def js_expand_l2(l1_text: str, l2_text: str) -> bool:
+            # 給 L1 子節點 AJAX 載入更多時間
+            await page.wait_for_timeout(500)
+            l2_click = await page.evaluate(f"""
+                (function() {{
+                    var allSpans = document.querySelectorAll('span.rtIn');
+                    for (var i = 0; i < allSpans.length; i++) {{
+                        if (allSpans[i].textContent.trim() !== '{l2_text}') continue;
+                        var l2Li = allSpans[i].closest('li');
+                        if (!l2Li) continue;
+                        // 往上走到 parent li，驗證其文字 = L1
+                        var parentLi = l2Li.parentElement
+                                       ? l2Li.parentElement.closest('li')
+                                       : null;
+                        if (!parentLi) continue;
+                        var parentSpan = parentLi.querySelector(
+                            ':scope > div.rtTop span.rtIn, ' +
+                            ':scope > div > span.rtIn, ' +
+                            ':scope > span.rtIn'
+                        );
+                        if (!parentSpan) continue;
+                        if (parentSpan.textContent.trim() !== '{l1_text}') continue;
+                        // 真的是 L1 子節點 → 展開或點選
+                        if (l2Li.querySelector('.rtMinus')) return 'already-expanded';
+                        var plus = l2Li.querySelector('span.rtPlus, span.rtExpand');
+                        if (plus) {{ plus.click(); return 'clicked-plus'; }}
+                        allSpans[i].click();
+                        return 'clicked-text';
+                    }}
+                    return 'not found';
+                }})();
+            """)
+            if l2_click in ("clicked-plus", "clicked-text", "already-expanded"):
+                await page.wait_for_timeout(600)
+                return True
+            # 自底向上沒找到 → 退回舊 scoped 搜尋 + fallback（保留為 plan B）
             result = await page.evaluate(f"""
                 (function() {{
                     var spans = document.querySelectorAll('span.rtIn');
