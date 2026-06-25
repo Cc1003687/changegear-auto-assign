@@ -1816,7 +1816,69 @@ async def set_incident_type(page: Page, level1: str, level2: str, level3: str):
                 if (inp) { inp.click(); inp.focus(); }
             })();
         """)
-        await page.wait_for_timeout(1000)
+        await page.wait_for_timeout(1200)
+
+        # ── 策略 A：直接呼叫 Telerik RadTreeView client-side API ──────
+        # 比手刻 DOM 點擊穩定得多：用 $find(treeId).findNodeByText(L1).set_expanded(true)
+        # 然後遞迴 get_nodes() 找 L2/L3 並 select() 最末層
+        api_result = await page.evaluate(f"""
+            (function() {{
+                if (typeof window.$find !== 'function') return 'no-find';
+                // 找 page 上所有 TreeView 控制項
+                var els = document.querySelectorAll('[id*="TreeView"], [id*="RadTreeView"]');
+                for (var k = 0; k < els.length; k++) {{
+                    var t = null;
+                    try {{ t = window.$find(els[k].id); }} catch(e) {{ continue; }}
+                    if (!t || typeof t.findNodeByText !== 'function') continue;
+                    var l1 = t.findNodeByText({json.dumps(level1)});
+                    if (!l1) continue;
+                    // L1 展開
+                    try {{ l1.set_expanded(true); }} catch(e) {{}}
+                    // L2 在 L1 children 內找
+                    var l1nodes = (typeof l1.get_nodes === 'function')
+                                  ? l1.get_nodes().get_count() : 0;
+                    if (l1nodes === 0) {{
+                        // 子節點未載入，回報後讓呼叫端再 retry
+                        return 'l1-expanded-no-children';
+                    }}
+                    var l2node = null;
+                    var childs = l1.get_nodes();
+                    for (var i = 0; i < childs.get_count(); i++) {{
+                        var c = childs.getNode(i);
+                        if (c.get_text().trim() === {json.dumps(level2)}) {{ l2node = c; break; }}
+                    }}
+                    if (!l2node) return 'l2-not-found-in-l1';
+                    // L3 處理
+                    var l3text = {json.dumps(level3 or '')}.trim();
+                    if (l3text) {{
+                        l2node.set_expanded(true);
+                        var l2childs = l2node.get_nodes();
+                        if (!l2childs || l2childs.get_count() === 0) {{
+                            return 'l2-expanded-no-children';
+                        }}
+                        for (var i = 0; i < l2childs.get_count(); i++) {{
+                            var c = l2childs.getNode(i);
+                            if (c.get_text().trim() === l3text) {{
+                                c.select(); return 'ok-l3';
+                            }}
+                        }}
+                        return 'l3-not-found';
+                    }} else {{
+                        l2node.select(); return 'ok-l2';
+                    }}
+                }}
+                return 'no-tree-control';
+            }})();
+        """)
+        log.debug(f"  Telerik API: {api_result}")
+        if api_result in ("ok-l2", "ok-l3"):
+            log.info(f"✓ Incident Type (Telerik API): {level1} > {level2} > {level3 or '(無L3)'}")
+            await page.keyboard.press("Escape")
+            await page.wait_for_timeout(300)
+            return
+
+        # API 沒成功 → 降到舊版 DOM 點擊邏輯
+        log.debug(f"  Telerik API 失敗 ({api_result})，改用 DOM 點擊邏輯")
 
         # ── L1：展開 + 動態等子節點真的出現（不再用固定 sleep）─────────
         async def js_expand_l1(text: str) -> bool:
